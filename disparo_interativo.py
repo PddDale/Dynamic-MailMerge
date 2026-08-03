@@ -400,7 +400,19 @@ def contar_linhas_validas(df, coluna_nome, coluna_email):
     return int(validos.sum())
 
 
-def mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path, assunto):
+def perguntar_confirmacao_leitura():
+    print("=" * 70)
+    print("Confirmação de leitura")
+    print("=" * 70)
+    print("O Outlook pode solicitar ao destinatário um recibo de leitura (o")
+    print("destinatário ainda pode recusar o envio do recibo). Depois do disparo,")
+    print("use a opção 'Verificar confirmações de leitura' deste script, apontando")
+    print("para o log gerado, para atualizar o status de cada contato.")
+    resposta = input("Solicitar confirmação de leitura para este disparo? (s/n): ").strip().lower()
+    return resposta == "s"
+
+
+def mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path, assunto, solicitar_confirmacao_leitura):
     n_linhas = contar_linhas_validas(planilha["df"], planilha["coluna_nome"], planilha["coluna_email"])
     print("=" * 70)
     print("RESUMO DA CONFIGURAÇÃO")
@@ -415,6 +427,7 @@ def mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path
     print(f"Logo/assinatura:          {logo_path}")
     print(f"Template:                 {template_path}")
     print(f"Linhas válidas a enviar:  {n_linhas}")
+    print(f"Confirmação de leitura:   {'Sim' if solicitar_confirmacao_leitura else 'Não'}")
     print("=" * 70)
     resposta = input("Confirma o início do envio? (s/n): ").strip().lower()
     return resposta == "s"
@@ -422,12 +435,16 @@ def mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path
 
 # ==================== ENVIO ===================================================
 
-def enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_template, assunto):
+def enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_template, assunto,
+                   solicitar_confirmacao_leitura=False):
     df = planilha["df"]
     coluna_nome = planilha["coluna_nome"]
     coluna_email = planilha["coluna_email"]
 
     import pandas as pd
+    from datetime import datetime
+
+    status_leitura_inicial = "Pendente" if solicitar_confirmacao_leitura else "Não solicitada"
 
     log = []
     for _, row in df.iterrows():
@@ -441,7 +458,10 @@ def enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_t
         if not nome or not email:
             continue
         if "/" in nome or "/" in email:
-            log.append({"Nome": nome, "Email": email, "Status": "Pulado: múltiplos valores na célula"})
+            log.append({
+                "Nome": nome, "Email": email, "Assunto": assunto, "Status": "Pulado: múltiplos valores na célula",
+                "DataHoraEnvio": "", "ConfirmacaoLeitura": "N/A", "DataHoraLeitura": "",
+            })
             print(f"[PULADO] {nome} / {email}: célula com múltiplos valores, precisa ser explodida antes.")
             continue
 
@@ -458,13 +478,22 @@ def enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_t
             )
 
             mail.SentOnBehalfOfName = endereco_resolvido
+            if solicitar_confirmacao_leitura:
+                mail.ReadReceiptRequested = True
             mail.Send()
 
-            log.append({"Nome": nome, "Email": email, "Status": "Enviado"})
+            log.append({
+                "Nome": nome, "Email": email, "Assunto": assunto, "Status": "Enviado",
+                "DataHoraEnvio": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "ConfirmacaoLeitura": status_leitura_inicial, "DataHoraLeitura": "",
+            })
             print(f"[OK] Enviado para {nome} ({email})")
 
         except Exception as e:
-            log.append({"Nome": nome, "Email": email, "Status": f"Erro: {e}"})
+            log.append({
+                "Nome": nome, "Email": email, "Assunto": assunto, "Status": f"Erro: {e}",
+                "DataHoraEnvio": "", "ConfirmacaoLeitura": "N/A", "DataHoraLeitura": "",
+            })
             print(f"[ERRO] Falha ao enviar para {email}: {e}")
 
         time.sleep(2)
@@ -473,32 +502,209 @@ def enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_t
     log_path = os.path.join(os.path.dirname(planilha["caminho"]), "log_envio.xlsx")
     log_df.to_excel(log_path, index=False)
     print(f"\nConcluído. Log salvo em: {log_path}")
+    if solicitar_confirmacao_leitura:
+        print("Recibos de leitura solicitados. Use a opção 'Verificar confirmações de leitura'")
+        print(f"deste script apontando para o arquivo acima para atualizar o status.")
+    return log_path
+
+
+# ==================== VERIFICAÇÃO DE CONFIRMAÇÃO DE LEITURA =================
+# O Outlook, quando ReadReceiptRequested=True é definido no envio, faz o
+# destinatário receber um pedido de recibo de leitura; se ele aceitar, um
+# item de relatório (MessageClass "REPORT.IPM.Note.IPNRN" para confirmado ou
+# "REPORT.IPM.Note.IPNNRN" para recusado) chega na Caixa de Entrada da conta
+# que enviou (CONTA_ENVIO). Esta seção varre essa caixa de entrada e cruza
+# os recibos encontrados com o log de envio (por e-mail do destinatário +
+# assunto), atualizando o status de leitura de cada linha.
+
+def localizar_pasta_entrada_caixa_compartilhada(namespace):
+    """Procura, entre as caixas de correio disponíveis no perfil do Outlook
+    atual, a que corresponde à conta de envio (CONTA_ENVIO / nome de
+    exibição no GAL) e retorna sua pasta "Caixa de Entrada". Retorna None se
+    não encontrar (ex.: a caixa compartilhada não foi adicionada ao perfil)."""
+    nomes_entrada = ["Caixa de Entrada", "Inbox"]
+    alvo_email = CONTA_ENVIO.strip().lower()
+    alvo_nome = NOME_EXIBICAO_FALLBACK.strip().lower()
+
+    for pasta_raiz in namespace.Folders:
+        try:
+            nome_raiz = (pasta_raiz.Name or "").strip().lower()
+        except Exception:
+            continue
+        if alvo_email in nome_raiz or alvo_nome in nome_raiz:
+            for nome_entrada in nomes_entrada:
+                try:
+                    return pasta_raiz.Folders(nome_entrada)
+                except Exception:
+                    continue
+    return None
+
+
+def extrair_assunto_original_do_recibo(assunto_recibo):
+    """Remove prefixos comuns (pt/en) que o Outlook adiciona ao assunto dos
+    relatórios de recibo, devolvendo o assunto original do e-mail enviado."""
+    prefixos = ["lido:", "read:", "recusado:", "declined:", "entregue:", "delivered:"]
+    texto = (assunto_recibo or "").strip()
+    baixo = texto.lower()
+    for prefixo in prefixos:
+        if baixo.startswith(prefixo):
+            return texto[len(prefixo):].strip()
+    return texto
+
+
+def verificar_confirmacoes_leitura(namespace):
+    print("=" * 70)
+    print("VERIFICAÇÃO DE CONFIRMAÇÕES DE LEITURA")
+    print("=" * 70)
+    import pandas as pd
+
+    while True:
+        caminho_log = limpar_caminho(input("Caminho do log de envio (log_envio.xlsx): "))
+        if os.path.exists(caminho_log) and caminho_log.lower().endswith((".xlsx", ".xls")):
+            break
+        print("Arquivo não encontrado ou formato inválido (use .xlsx/.xls). Tente novamente.")
+
+    try:
+        df_log = pd.read_excel(caminho_log)
+    except Exception as e:
+        print(f"[ERRO] Não foi possível ler o log ({e}).")
+        return
+
+    colunas_esperadas = {"Nome", "Email", "Status"}
+    if not colunas_esperadas.issubset(set(df_log.columns)):
+        print(f"[ERRO] O log precisa conter as colunas {colunas_esperadas}. "
+              f"Colunas encontradas: {list(df_log.columns)}")
+        return
+
+    if "Assunto" not in df_log.columns:
+        df_log["Assunto"] = ""
+    if "ConfirmacaoLeitura" not in df_log.columns:
+        df_log["ConfirmacaoLeitura"] = "Pendente"
+    if "DataHoraLeitura" not in df_log.columns:
+        df_log["DataHoraLeitura"] = ""
+
+    print(f"\nProcurando a Caixa de Entrada da conta {CONTA_ENVIO} no perfil do Outlook...")
+    pasta_entrada = localizar_pasta_entrada_caixa_compartilhada(namespace)
+    if pasta_entrada is None:
+        print(f"[AVISO] A caixa {CONTA_ENVIO} não foi encontrada como mailbox adicional neste perfil.")
+        print("        Verificando na Caixa de Entrada padrão do usuário atual (pode não ser onde")
+        print("        os recibos chegam, dependendo de como o Outlook está configurado).")
+        pasta_entrada = namespace.GetDefaultFolder(6)  # olFolderInbox
+    else:
+        print("Caixa de entrada da conta de envio localizada.")
+
+    filtro = (
+        "@SQL=" +
+        "(\"http://schemas.microsoft.com/mapi/proptag/0x001A001E\" LIKE 'REPORT.IPM.Note.IPNRN%' "
+        "OR \"http://schemas.microsoft.com/mapi/proptag/0x001A001E\" LIKE 'REPORT.IPM.Note.IPNNRN%')"
+    )
+    try:
+        itens_recibo = pasta_entrada.Items.Restrict(filtro)
+    except Exception as e:
+        print(f"[ERRO] Falha ao consultar recibos de leitura na caixa de entrada: {e}")
+        return
+
+    total_confirmados = 0
+    total_recusados = 0
+    for item in itens_recibo:
+        try:
+            classe = str(item.MessageClass)
+            email_leitor = str(getattr(item, "SenderEmailAddress", "") or "").strip().lower()
+            assunto_original = extrair_assunto_original_do_recibo(str(item.Subject or ""))
+            data_leitura = str(item.ReceivedTime)
+        except Exception:
+            continue
+
+        recusado = classe.startswith("REPORT.IPM.Note.IPNNRN")
+
+        mascara = (
+            (df_log["Email"].astype(str).str.strip().str.lower() == email_leitor)
+            & (df_log["Status"].astype(str).str.strip() == "Enviado")
+            & (df_log["Assunto"].astype(str).str.strip().str.lower() == assunto_original.strip().lower())
+        )
+        if not mascara.any():
+            # Fallback: se o assunto não bater (ex.: log antigo sem a coluna
+            # preenchida), tenta casar só pelo e-mail dentro deste log.
+            mascara = (
+                (df_log["Email"].astype(str).str.strip().str.lower() == email_leitor)
+                & (df_log["Status"].astype(str).str.strip() == "Enviado")
+            )
+        if not mascara.any():
+            continue
+
+        status_novo = "Recusada" if recusado else "Confirmada"
+        df_log.loc[mascara, "ConfirmacaoLeitura"] = status_novo
+        df_log.loc[mascara, "DataHoraLeitura"] = data_leitura
+        if recusado:
+            total_recusados += 1
+        else:
+            total_confirmados += 1
+
+    df_log.to_excel(caminho_log, index=False)
+
+    n_enviados = int((df_log["Status"] == "Enviado").sum())
+    n_pendentes = int(
+        ((df_log["Status"] == "Enviado") & (df_log["ConfirmacaoLeitura"] == "Pendente")).sum()
+    )
+    print("\n" + "=" * 70)
+    print("RESULTADO DA VERIFICAÇÃO")
+    print("=" * 70)
+    print(f"E-mails enviados no log:              {n_enviados}")
+    print(f"Confirmações de leitura recebidas:    {total_confirmados}")
+    print(f"Recusas de confirmação recebidas:     {total_recusados}")
+    print(f"Ainda pendentes (sem resposta):       {n_pendentes}")
+    print(f"\nLog atualizado salvo em: {caminho_log}")
 
 
 # ==================== ORQUESTRAÇÃO ============================================
 
+def escolher_modo_operacao():
+    print("=" * 70)
+    print("O que você deseja fazer?")
+    print("=" * 70)
+    print("  1. Novo disparo de e-mails")
+    print("  2. Verificar confirmações de leitura de um disparo já feito")
+    while True:
+        escolha = input("Escolha uma opção (1/2): ").strip()
+        if escolha in ("1", "2"):
+            return escolha
+        print("Opção inválida. Digite 1 ou 2.")
+
+
 def main():
+    modo = escolher_modo_operacao()
+    print()
+
     executar_verificacao_ambiente()
+
+    import win32com.client as win32
+    outlook = win32.Dispatch("Outlook.Application")
+    namespace = outlook.GetNamespace("MAPI")
+
+    if modo == "2":
+        verificar_confirmacoes_leitura(namespace)
+        return
+
     email_usuario = perguntar_email_usuario()
     planilha = selecionar_planilha()
     logo_path = perguntar_caminho_logo()
     template_path, corpo_html_template = selecionar_template()
 
     assunto = input("Assunto do e-mail: ").strip()
+    solicitar_confirmacao_leitura = perguntar_confirmacao_leitura()
+    print()
 
-    if not mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path, assunto):
+    if not mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path, assunto,
+                                       solicitar_confirmacao_leitura):
         print("Operação cancelada pelo usuário.")
         return
 
-    import win32com.client as win32
-
-    outlook = win32.Dispatch("Outlook.Application")
-    namespace = outlook.GetNamespace("MAPI")
     endereco_resolvido = resolver_caixa_compartilhada(namespace)
     print(f"\nEndereço final usado no envio: {endereco_resolvido}")
     print(f"Enviando em nome de: {CONTA_ENVIO}\n")
 
-    enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_template, assunto)
+    enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_template, assunto,
+                  solicitar_confirmacao_leitura)
 
 
 if __name__ == "__main__":
