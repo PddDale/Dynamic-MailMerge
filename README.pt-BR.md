@@ -56,21 +56,37 @@ As duas rodam exatamente o mesmo fluxo; use a que preferir.
    preservada.
 7. **Assunto e confirmação de leitura**: pede o assunto do e-mail e
    pergunta se deve solicitar recibo de leitura ao destinatário.
-8. **Resumo e confirmação**: mostra um resumo de tudo que foi
-   configurado e pede confirmação final antes de iniciar o envio.
-9. **Envio**: dispara um e-mail por contato válido da planilha, com
-   pausa entre envios, e salva um log (`log_envio.xlsx`, na mesma pasta
-   da planilha) com o status de cada linha (enviado, erro, ou pulado
-   por dados inválidos).
+8. **Log de envio**: pergunta se deve ser gerado um log de envio
+   (arquivo Excel com o status de cada e-mail). Se sim, pergunta o
+   caminho onde salvar (Enter usa o padrão: `log_envio.xlsx` na mesma
+   pasta da planilha de contatos).
+9. **Resumo e confirmação**: mostra um resumo de tudo que foi
+   configurado — incluindo se o log de envio será gerado e em qual
+   caminho — e pede confirmação final antes de iniciar o envio.
+10. **Envio**: dispara um e-mail por contato válido da planilha, com
+    pausa entre envios. Se a geração de log foi confirmada, salva o
+    arquivo no caminho escolhido com o status de cada linha (enviado,
+    erro, ou pulado por dados inválidos).
 
 ## Verificação de confirmação de leitura
 
 O script também tem um segundo modo de operação, para depois de um
-disparo já feito: aponta para o `log_envio.xlsx` gerado e para o
-e-mail/nome de exibição da caixa usada no envio original, e ele varre a
+disparo já feito: aponta para o `log_envio.xlsx` gerado e escolhe a
+caixa usada no envio original a partir da mesma lista de contas e
+caixas compartilhadas/pastas adicionais detectadas no perfil do Outlook
+(mesmo sistema usado na seleção da caixa de envio, na Etapa 3 — também
+aceita digitar o e-mail/nome manualmente). O script então varre a
 caixa de entrada correspondente procurando os recibos de leitura
-(confirmados ou recusados), atualizando o log com o status e a data de
-cada leitura.
+(confirmados ou recusados), atualizando o log com o status e a data/hora
+de cada leitura no formato `DD/MM/AAAA HH:MM`.
+
+Quando o envio original foi feito "em nome de" uma caixa compartilhada,
+o Exchange costuma entregar os recibos de leitura na Caixa de Entrada
+da conta pessoal que de fato enviou a mensagem, e não na Caixa de
+Entrada própria da caixa compartilhada. Por isso, além da caixa
+escolhida, o script sempre verifica também a Caixa de Entrada padrão
+do usuário atual, evitando que os recibos passem despercebidos (e sem
+duplicar resultados, caso as duas apontem para a mesma pasta).
 
 ## Requisitos
 

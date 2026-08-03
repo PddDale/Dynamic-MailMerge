@@ -58,20 +58,38 @@ Both run exactly the same flow; use whichever you prefer.
    preserved.
 7. **Subject and read receipt**: asks for the e-mail subject and
    whether a read receipt should be requested from the recipient.
-8. **Summary and confirmation**: shows a summary of everything that was
-   configured and asks for final confirmation before starting to send.
-9. **Sending**: sends one e-mail per valid spreadsheet contact, with a
-   pause between sends, and saves a log (`send_log.xlsx`, in the same
-   folder as the spreadsheet) with the status of each row (sent,
-   error, or skipped due to invalid data).
+8. **Sending log**: asks whether a sending log (Excel file with the
+   status of each e-mail) should be generated. If so, asks for the path
+   where it should be saved (press Enter to use the default:
+   `send_log.xlsx` in the same folder as the contact spreadsheet).
+9. **Summary and confirmation**: shows a summary of everything that was
+   configured — including whether the sending log will be generated and
+   at which path — and asks for final confirmation before starting to
+   send.
+10. **Sending**: sends one e-mail per valid spreadsheet contact, with a
+    pause between sends. If log generation was confirmed, saves the
+    file at the chosen path with the status of each row (sent, error,
+    or skipped due to invalid data).
 
 ## Read receipt check
 
 The script also has a second operation mode, for after a send has
-already been done: point it to the generated `send_log.xlsx` and to the
-e-mail/display name of the mailbox used in the original send, and it
-scans the corresponding inbox looking for read receipts (confirmed or
-declined), updating the log with the status and date of each read.
+already been done: point it to the generated `send_log.xlsx` and pick
+the mailbox used in the original send from the same list of accounts
+and shared mailboxes/additional folders detected in the Outlook
+profile (the same system used for the sending mailbox selection in
+Step 3 — typing the e-mail/name manually is also supported). The
+script then scans the corresponding inbox looking for read receipts
+(confirmed or declined), updating the log with the status and the
+date/time of each read in `DD/MM/YYYY HH:MM` format.
+
+When the original send was done "on behalf of" a shared mailbox,
+Exchange usually delivers read receipts to the Inbox of the personal
+account that actually sent the message, not to the shared mailbox's
+own Inbox. Because of that, in addition to the chosen mailbox, the
+script always also checks the current user's default Inbox, so
+receipts don't go unnoticed (without duplicating results if both point
+to the same folder).
 
 ## Requirements
 

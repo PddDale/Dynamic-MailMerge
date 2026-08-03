@@ -683,8 +683,33 @@ def perguntar_confirmacao_leitura():
     return resposta == "s"
 
 
+def perguntar_geracao_log(planilha):
+    print("=" * 70)
+    print("Log de envio")
+    print("=" * 70)
+    resposta = input("Deseja gerar um log de envio (arquivo Excel) com o status de cada e-mail? (s/n): ").strip().lower()
+    if resposta != "s":
+        print()
+        return False, None
+
+    caminho_padrao = os.path.join(os.path.dirname(planilha["caminho"]), "log_envio.xlsx")
+    caminho = limpar_caminho(input(
+        f"Caminho onde o log deve ser salvo (Enter para usar o padrão: {caminho_padrao}): "
+    ))
+    if not caminho:
+        print()
+        return True, caminho_padrao
+
+    if os.path.isdir(caminho):
+        caminho = os.path.join(caminho, "log_envio.xlsx")
+    elif not caminho.lower().endswith((".xlsx", ".xls")):
+        caminho = caminho + ".xlsx"
+    print()
+    return True, caminho
+
+
 def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, template_path, assunto,
-                                solicitar_confirmacao_leitura):
+                                solicitar_confirmacao_leitura, gerar_log, caminho_log):
     n_linhas = contar_linhas_validas(planilha["df"], planilha["coluna_nome"], planilha["coluna_email"])
     rotulo_caixa = caixa_envio["endereco_envio"] or "conta padrão do Outlook"
     print("=" * 70)
@@ -702,6 +727,7 @@ def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, 
     print(f"Template:                 {template_path}")
     print(f"Linhas válidas a enviar:  {n_linhas}")
     print(f"Confirmação de leitura:   {'Sim' if solicitar_confirmacao_leitura else 'Não'}")
+    print(f"Log de envio:             {'Sim (' + caminho_log + ')' if gerar_log else 'Não'}")
     print("=" * 70)
     resposta = input("Confirma o início do envio? (s/n): ").strip().lower()
     return resposta == "s"
@@ -710,7 +736,7 @@ def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, 
 # ==================== ENVIO ===================================================
 
 def enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template, assunto,
-                   solicitar_confirmacao_leitura=False):
+                   solicitar_confirmacao_leitura=False, gerar_log=True, caminho_log=None):
     df = planilha["df"]
     coluna_nome = planilha["coluna_nome"]
     coluna_email = planilha["coluna_email"]
@@ -777,8 +803,12 @@ def enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template
 
         time.sleep(2)
 
+    if not gerar_log:
+        print("\nConcluído. Geração de log de envio desativada nesta execução.")
+        return None
+
     log_df = pd.DataFrame(log)
-    log_path = os.path.join(os.path.dirname(planilha["caminho"]), "log_envio.xlsx")
+    log_path = caminho_log or os.path.join(os.path.dirname(planilha["caminho"]), "log_envio.xlsx")
     log_df.to_excel(log_path, index=False)
     print(f"\nConcluído. Log salvo em: {log_path}")
     if solicitar_confirmacao_leitura:
@@ -791,7 +821,8 @@ def enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template
 # O Outlook, quando ReadReceiptRequested=True é definido no envio, faz o
 # destinatário receber um pedido de recibo de leitura; se ele aceitar, um
 # item de relatório (MessageClass "REPORT.IPM.Note.IPNRN" para confirmado ou
-# "REPORT.IPM.Note.IPNNRN" para recusado) chega na Caixa de Entrada da conta
+# "REPORT.IPM.Note.IPNNRN" para recusado — em algumas configurações pode vir
+# sem o prefixo "REPORT.") chega na Caixa de Entrada da conta
 # que enviou. Esta seção varre essa caixa de entrada e cruza os recibos
 # encontrados com o log de envio (por e-mail do destinatário + assunto),
 # atualizando o status de leitura de cada linha.
@@ -830,6 +861,63 @@ def extrair_assunto_original_do_recibo(assunto_recibo):
     return texto
 
 
+def perguntar_caixa_para_verificacao(namespace):
+    """Reaproveita a mesma detecção de caixas do perfil do Outlook (contas
+    completas e caixas compartilhadas/pastas adicionais) usada na etapa de
+    seleção da caixa de envio, para que o usuário escolha de forma
+    consistente qual caixa consultar em busca dos recibos de leitura."""
+    caixas = listar_caixas_disponiveis(namespace)
+
+    print("Caixas detectadas no perfil do Outlook:")
+    for i, caixa in enumerate(caixas, start=1):
+        rotulo_tipo = "conta completa" if caixa["tipo"] == "conta" else "pasta adicional / possível caixa compartilhada"
+        print(f"  {i}. {caixa['rotulo']} ({rotulo_tipo})")
+
+    while True:
+        escolha = input(
+            "E-mail ou nome de exibição da caixa usada no envio original "
+            "(número da lista acima ou digite o e-mail/nome): "
+        ).strip()
+        if escolha.isdigit() and 1 <= int(escolha) <= len(caixas):
+            return caixas[int(escolha) - 1]["rotulo"]
+        if escolha:
+            return escolha
+        print("Valor vazio. Digite o número de uma opção da lista ou um e-mail/nome válido.")
+
+
+def obter_email_smtp_do_recibo(item):
+    """Para contatos internos do Exchange, SenderEmailAddress do item de
+    recibo às vezes vem no formato X.500 (legacyExchangeDN) em vez do
+    endereço SMTP, o que quebraria a comparação com a planilha/log. Esta
+    função tenta algumas formas de obter o endereço SMTP real."""
+    try:
+        bruto = str(getattr(item, "SenderEmailAddress", "") or "").strip()
+    except Exception:
+        bruto = ""
+    if "@" in bruto:
+        return bruto.lower()
+
+    try:
+        smtp = item.PropertyAccessor.GetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
+        )
+        if smtp and "@" in smtp:
+            return smtp.strip().lower()
+    except Exception:
+        pass
+
+    try:
+        sender = item.Sender
+        if sender is not None and sender.AddressEntry.Type == "EX":
+            smtp = sender.AddressEntry.GetExchangeUser().PrimarySmtpAddress
+            if smtp and "@" in smtp:
+                return smtp.strip().lower()
+    except Exception:
+        pass
+
+    return bruto.lower()
+
+
 def verificar_confirmacoes_leitura(namespace):
     print("=" * 70)
     print("VERIFICAÇÃO DE CONFIRMAÇÕES DE LEITURA")
@@ -861,43 +949,122 @@ def verificar_confirmacoes_leitura(namespace):
     if "DataHoraLeitura" not in df_log.columns:
         df_log["DataHoraLeitura"] = ""
 
-    alvo = input(
-        "E-mail ou nome de exibição da caixa usada no envio original (para localizar os recibos): "
-    ).strip()
+    # Se o log já existia e essas colunas ficaram totalmente vazias/em branco
+    # (ex.: gerado numa execução anterior deste script antes de haver
+    # recibos), o pandas/Excel pode tê-las lido de volta como dtype
+    # numérico (float64, coluna só de NaN). Forçamos para texto para poder
+    # gravar valores como "Confirmada"/data e hora sem erro de tipo.
+    df_log["Assunto"] = df_log["Assunto"].astype(object).where(df_log["Assunto"].notna(), "")
+    df_log["ConfirmacaoLeitura"] = df_log["ConfirmacaoLeitura"].astype(object).where(
+        df_log["ConfirmacaoLeitura"].notna(), "Pendente"
+    )
+    df_log["DataHoraLeitura"] = df_log["DataHoraLeitura"].astype(object).where(
+        df_log["DataHoraLeitura"].notna(), ""
+    )
+
+    alvo = perguntar_caixa_para_verificacao(namespace)
 
     print(f"\nProcurando a Caixa de Entrada de '{alvo}' no perfil do Outlook...")
-    pasta_entrada = localizar_pasta_entrada_caixa_compartilhada(namespace, alvo)
-    if pasta_entrada is None:
+    pasta_entrada_alvo = localizar_pasta_entrada_caixa_compartilhada(namespace, alvo)
+    pasta_entrada_padrao = namespace.GetDefaultFolder(6)  # olFolderInbox
+
+    pastas_para_buscar = []
+    if pasta_entrada_alvo is None:
         print(f"[AVISO] '{alvo}' não foi encontrada como mailbox adicional neste perfil.")
-        print("        Verificando na Caixa de Entrada padrão do usuário atual (pode não ser onde")
-        print("        os recibos chegam, dependendo de como o Outlook está configurado).")
-        pasta_entrada = namespace.GetDefaultFolder(6)  # olFolderInbox
+        print("        Verificando apenas na Caixa de Entrada padrão do usuário atual.")
     else:
         print("Caixa de entrada da conta de envio localizada.")
+        pastas_para_buscar.append(pasta_entrada_alvo)
 
-    filtro = (
-        "@SQL=" +
-        "(\"http://schemas.microsoft.com/mapi/proptag/0x001A001E\" LIKE 'REPORT.IPM.Note.IPNRN%' "
-        "OR \"http://schemas.microsoft.com/mapi/proptag/0x001A001E\" LIKE 'REPORT.IPM.Note.IPNNRN%')"
-    )
-    try:
-        itens_recibo = pasta_entrada.Items.Restrict(filtro)
-    except Exception as e:
-        print(f"[ERRO] Falha ao consultar recibos de leitura na caixa de entrada: {e}")
-        return
+    # Quando o envio original foi feito "em nome de" uma caixa compartilhada
+    # (SentOnBehalfOfName), o Exchange normalmente entrega os recibos de
+    # leitura na Caixa de Entrada da conta pessoal que de fato enviou a
+    # mensagem, e não na Caixa de Entrada própria da caixa compartilhada.
+    # Por isso, sempre verificamos também a Caixa de Entrada padrão do
+    # usuário atual, além da caixa escolhida (evitando duplicidade se forem
+    # a mesma pasta).
+    if pasta_entrada_alvo is None or pasta_entrada_alvo.EntryID != pasta_entrada_padrao.EntryID:
+        pastas_para_buscar.append(pasta_entrada_padrao)
+
+    # Em vez de usar Items.Restrict() com uma query DASL sobre o MessageClass
+    # (que se mostrou pouco confiável dependendo da versão/configuração do
+    # Outlook), percorremos todos os itens da pasta e checamos o
+    # MessageClass diretamente em Python — mais lento, porém muito mais
+    # confiável para encontrar os recibos de leitura/recusa.
+    itens_recibo = []
+    ids_vistos = set()
+    candidatos_nao_reconhecidos = []
+    prefixos_assunto_recibo = ("lido:", "read:", "recusado:", "declined:", "entregue:", "delivered:")
+    for pasta in pastas_para_buscar:
+        try:
+            itens_pasta = pasta.Items
+            total_itens = itens_pasta.Count
+        except Exception as e:
+            print(f"[ERRO] Falha ao acessar os itens de '{pasta.Name}': {e}")
+            continue
+        print(f"Verificando {total_itens} item(ns) em '{pasta.Name}'...")
+        for item in itens_pasta:
+            try:
+                classe_item = str(item.MessageClass)
+            except Exception:
+                continue
+            if not (classe_item.startswith("REPORT.IPM.Note.IPNRN") or classe_item.startswith("REPORT.IPM.Note.IPNNRN")
+                    or classe_item.startswith("IPM.Note.IPNRN") or classe_item.startswith("IPM.Note.IPNNRN")):
+                # Diagnóstico: se o assunto parece ser de um recibo (prefixo
+                # "Lido:"/"Read:"/etc.) mas o MessageClass não bateu com o
+                # esperado, guardamos para mostrar ao usuário — ajuda a
+                # identificar rapidamente se o Outlook está usando uma classe
+                # diferente da documentada.
+                try:
+                    assunto_item = str(item.Subject or "")
+                except Exception:
+                    assunto_item = ""
+                if assunto_item.strip().lower().startswith(prefixos_assunto_recibo):
+                    candidatos_nao_reconhecidos.append((assunto_item, classe_item))
+                continue
+            try:
+                entry_id = item.EntryID
+            except Exception:
+                entry_id = None
+            if entry_id is not None and entry_id in ids_vistos:
+                continue
+            if entry_id is not None:
+                ids_vistos.add(entry_id)
+            itens_recibo.append(item)
+
+    if not itens_recibo:
+        print("Nenhum recibo de leitura encontrado nas caixas verificadas.")
+        if candidatos_nao_reconhecidos:
+            print("\n[DIAGNÓSTICO] Encontrado(s) item(ns) com assunto de recibo, mas com")
+            print("MessageClass diferente do esperado (IPM.Note.IPNRN/IPNNRN):")
+            for assunto_item, classe_item in candidatos_nao_reconhecidos:
+                print(f"  - Assunto: {assunto_item!r} | MessageClass: {classe_item!r}")
 
     total_confirmados = 0
     total_recusados = 0
     for item in itens_recibo:
         try:
             classe = str(item.MessageClass)
-            email_leitor = str(getattr(item, "SenderEmailAddress", "") or "").strip().lower()
+            email_leitor = obter_email_smtp_do_recibo(item)
             assunto_original = extrair_assunto_original_do_recibo(str(item.Subject or ""))
-            data_leitura = str(item.ReceivedTime)
-        except Exception:
+        except Exception as e:
+            print(f"[DIAGNÓSTICO] Falha ao processar um recibo (item ignorado): {e}")
             continue
 
-        recusado = classe.startswith("REPORT.IPM.Note.IPNNRN")
+        # Itens de relatório (recibo de leitura/recusa) às vezes não expõem
+        # ReceivedTime da mesma forma que um e-mail comum; usamos
+        # CreationTime como alternativa e, no limite, deixamos em branco em
+        # vez de descartar o recibo inteiro. O valor é formatado como
+        # DD/MM/AAAA HH:MM para facilitar a leitura no log.
+        try:
+            data_leitura = item.ReceivedTime.strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            try:
+                data_leitura = item.CreationTime.strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                data_leitura = ""
+
+        recusado = classe.startswith("REPORT.IPM.Note.IPNNRN") or classe.startswith("IPM.Note.IPNNRN")
 
         mascara = (
             (df_log["Email"].astype(str).str.strip().str.lower() == email_leitor)
@@ -905,13 +1072,25 @@ def verificar_confirmacoes_leitura(namespace):
             & (df_log["Assunto"].astype(str).str.strip().str.lower() == assunto_original.strip().lower())
         )
         if not mascara.any():
-            # Fallback: se o assunto não bater (ex.: log antigo sem a coluna
-            # preenchida), tenta casar só pelo e-mail dentro deste log.
+            # Fallback: só entra em ação quando a própria linha do log não tem
+            # assunto registrado (ex.: log gerado por uma execução antiga
+            # deste script, antes de a coluna "Assunto" existir). Nesse caso,
+            # casamos só pelo e-mail dentro deste log. NÃO usar esse fallback
+            # quando a linha do log já tem um assunto diferente do recibo:
+            # isso faria um recibo de um disparo anterior (ex.: "teste 7")
+            # ser incorretamente atribuído a um disparo diferente para o
+            # mesmo destinatário (ex.: "teste 9"), inflando as confirmações.
             mascara = (
                 (df_log["Email"].astype(str).str.strip().str.lower() == email_leitor)
                 & (df_log["Status"].astype(str).str.strip() == "Enviado")
+                & (df_log["Assunto"].astype(str).str.strip() == "")
             )
         if not mascara.any():
+            print(
+                f"[DIAGNÓSTICO] Recibo recebido de '{email_leitor}' (assunto do recibo: "
+                f"'{assunto_original}') não encontrou nenhuma linha correspondente no log "
+                f"(com Status='Enviado')."
+            )
             continue
 
         status_novo = "Recusada" if recusado else "Confirmada"
@@ -977,15 +1156,15 @@ def main():
 
     assunto = input("Assunto do e-mail: ").strip()
     solicitar_confirmacao_leitura = perguntar_confirmacao_leitura()
-    print()
+    gerar_log, caminho_log = perguntar_geracao_log(planilha)
 
     if not mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, template_path, assunto,
-                                       solicitar_confirmacao_leitura):
+                                       solicitar_confirmacao_leitura, gerar_log, caminho_log):
         print("Operação cancelada pelo usuário.")
         return
 
     enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template, assunto,
-                  solicitar_confirmacao_leitura)
+                  solicitar_confirmacao_leitura, gerar_log, caminho_log)
 
 
 if __name__ == "__main__":

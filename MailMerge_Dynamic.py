@@ -683,8 +683,33 @@ def ask_read_receipt():
     return answer == "y"
 
 
+def ask_generate_log(spreadsheet):
+    print("=" * 70)
+    print("Sending log")
+    print("=" * 70)
+    answer = input("Do you want to generate a sending log (Excel file) with the status of each e-mail? (y/n): ").strip().lower()
+    if answer != "y":
+        print()
+        return False, None
+
+    default_path = os.path.join(os.path.dirname(spreadsheet["path"]), "send_log.xlsx")
+    path = clean_path(input(
+        f"Path where the log should be saved (press Enter to use the default: {default_path}): "
+    ))
+    if not path:
+        print()
+        return True, default_path
+
+    if os.path.isdir(path):
+        path = os.path.join(path, "send_log.xlsx")
+    elif not path.lower().endswith((".xlsx", ".xls")):
+        path = path + ".xlsx"
+    print()
+    return True, path
+
+
 def show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path, template_path, subject,
-                              request_read_receipt):
+                              request_read_receipt, generate_log, log_path):
     valid_count = count_valid_rows(spreadsheet["df"], spreadsheet["name_column"], spreadsheet["email_column"])
     mailbox_label = sending_mailbox["sending_address"] or "default Outlook account"
     print("=" * 70)
@@ -702,6 +727,7 @@ def show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path
     print(f"Template:                 {template_path}")
     print(f"Valid rows to send:       {valid_count}")
     print(f"Read receipt:             {'Yes' if request_read_receipt else 'No'}")
+    print(f"Sending log:              {'Yes (' + log_path + ')' if generate_log else 'No'}")
     print("=" * 70)
     answer = input("Confirm the start of the sending? (y/n): ").strip().lower()
     return answer == "y"
@@ -710,7 +736,7 @@ def show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path
 # ==================== SENDING ===================================================
 
 def send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_template, subject,
-                 request_read_receipt=False):
+                 request_read_receipt=False, generate_log=True, log_path=None):
     df = spreadsheet["df"]
     name_column = spreadsheet["name_column"]
     email_column = spreadsheet["email_column"]
@@ -777,8 +803,12 @@ def send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_temp
 
         time.sleep(2)
 
+    if not generate_log:
+        print("\nDone. Sending log generation disabled for this run.")
+        return None
+
     log_df = pd.DataFrame(log)
-    log_path = os.path.join(os.path.dirname(spreadsheet["path"]), "send_log.xlsx")
+    log_path = log_path or os.path.join(os.path.dirname(spreadsheet["path"]), "send_log.xlsx")
     log_df.to_excel(log_path, index=False)
     print(f"\nDone. Log saved to: {log_path}")
     if request_read_receipt:
@@ -791,7 +821,8 @@ def send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_temp
 # When ReadReceiptRequested=True is set on sending, Outlook makes the
 # recipient receive a read receipt request; if they accept it, a report
 # item (MessageClass "REPORT.IPM.Note.IPNRN" for confirmed or
-# "REPORT.IPM.Note.IPNNRN" for declined) arrives in the Inbox of the
+# "REPORT.IPM.Note.IPNNRN" for declined — some setups may omit the
+# "REPORT." prefix) arrives in the Inbox of the
 # account that sent the message. This section scans that inbox and
 # cross-references the found receipts with the sending log (by recipient
 # e-mail + subject), updating the read status of each row.
@@ -830,6 +861,63 @@ def extract_original_subject_from_receipt(receipt_subject):
     return text
 
 
+def ask_mailbox_for_receipt_check(namespace):
+    """Reuses the same Outlook profile mailbox detection (full accounts and
+    shared mailboxes/additional folders) used in the sending mailbox
+    selection step, so the user can consistently choose which mailbox to
+    check for read receipts."""
+    mailboxes = list_available_mailboxes(namespace)
+
+    print("Mailboxes detected in the Outlook profile:")
+    for i, mailbox in enumerate(mailboxes, start=1):
+        type_label = "full account" if mailbox["type"] == "account" else "additional folder / possible shared mailbox"
+        print(f"  {i}. {mailbox['label']} ({type_label})")
+
+    while True:
+        choice = input(
+            "E-mail or display name of the mailbox used in the original send "
+            "(list number above or type the e-mail/name): "
+        ).strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(mailboxes):
+            return mailboxes[int(choice) - 1]["label"]
+        if choice:
+            return choice
+        print("Empty value. Type the number of a list option or a valid e-mail/name.")
+
+
+def get_receipt_smtp_address(item):
+    """For internal Exchange contacts, the receipt item's SenderEmailAddress
+    sometimes comes in X.500 (legacyExchangeDN) format instead of the SMTP
+    address, which would break the comparison against the spreadsheet/log.
+    This function tries a few ways to get the real SMTP address."""
+    try:
+        raw = str(getattr(item, "SenderEmailAddress", "") or "").strip()
+    except Exception:
+        raw = ""
+    if "@" in raw:
+        return raw.lower()
+
+    try:
+        smtp = item.PropertyAccessor.GetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x5D01001F"
+        )
+        if smtp and "@" in smtp:
+            return smtp.strip().lower()
+    except Exception:
+        pass
+
+    try:
+        sender = item.Sender
+        if sender is not None and sender.AddressEntry.Type == "EX":
+            smtp = sender.AddressEntry.GetExchangeUser().PrimarySmtpAddress
+            if smtp and "@" in smtp:
+                return smtp.strip().lower()
+    except Exception:
+        pass
+
+    return raw.lower()
+
+
 def check_read_receipts(namespace):
     print("=" * 70)
     print("READ RECEIPT CHECK")
@@ -861,43 +949,119 @@ def check_read_receipts(namespace):
     if "ReadAt" not in log_df.columns:
         log_df["ReadAt"] = ""
 
-    target = input(
-        "E-mail or display name of the mailbox used in the original send (to locate the receipts): "
-    ).strip()
+    # If the log already existed and these columns were completely
+    # empty/blank (e.g., generated by a previous run of this script before
+    # any receipts existed), pandas/Excel may have read them back as a
+    # numeric dtype (float64, an all-NaN column). Force them to text so
+    # values like "Confirmed"/date-time can be written without a type error.
+    log_df["Subject"] = log_df["Subject"].astype(object).where(log_df["Subject"].notna(), "")
+    log_df["ReadReceipt"] = log_df["ReadReceipt"].astype(object).where(
+        log_df["ReadReceipt"].notna(), "Pending"
+    )
+    log_df["ReadAt"] = log_df["ReadAt"].astype(object).where(log_df["ReadAt"].notna(), "")
+
+    target = ask_mailbox_for_receipt_check(namespace)
 
     print(f"\nLooking for the Inbox of '{target}' in the Outlook profile...")
-    inbox_folder = locate_shared_mailbox_inbox(namespace, target)
-    if inbox_folder is None:
+    target_inbox_folder = locate_shared_mailbox_inbox(namespace, target)
+    default_inbox_folder = namespace.GetDefaultFolder(6)  # olFolderInbox
+
+    folders_to_search = []
+    if target_inbox_folder is None:
         print(f"[WARNING] '{target}' was not found as an additional mailbox in this profile.")
-        print("        Checking the current user's default Inbox instead (this may not be")
-        print("        where the receipts arrive, depending on how Outlook is configured).")
-        inbox_folder = namespace.GetDefaultFolder(6)  # olFolderInbox
+        print("        Checking only the current user's default Inbox.")
     else:
         print("Sending account's inbox located.")
+        folders_to_search.append(target_inbox_folder)
 
-    filter_ = (
-        "@SQL=" +
-        "(\"http://schemas.microsoft.com/mapi/proptag/0x001A001E\" LIKE 'REPORT.IPM.Note.IPNRN%' "
-        "OR \"http://schemas.microsoft.com/mapi/proptag/0x001A001E\" LIKE 'REPORT.IPM.Note.IPNNRN%')"
-    )
-    try:
-        receipt_items = inbox_folder.Items.Restrict(filter_)
-    except Exception as e:
-        print(f"[ERROR] Failed to query read receipts in the inbox: {e}")
-        return
+    # When the original send was done "on behalf of" a shared mailbox
+    # (SentOnBehalfOfName), Exchange usually delivers read receipts to the
+    # Inbox of the personal account that actually sent the message, not to
+    # the shared mailbox's own Inbox. So we always also check the current
+    # user's default Inbox, in addition to the chosen mailbox (avoiding
+    # duplicates if they turn out to be the same folder).
+    if target_inbox_folder is None or target_inbox_folder.EntryID != default_inbox_folder.EntryID:
+        folders_to_search.append(default_inbox_folder)
+
+    # Instead of using Items.Restrict() with a DASL query over MessageClass
+    # (which proved unreliable depending on the Outlook version/setup), we
+    # walk every item in the folder and check MessageClass directly in
+    # Python — slower, but much more reliable for finding read/decline
+    # receipts.
+    receipt_items = []
+    seen_ids = set()
+    unrecognized_candidates = []
+    receipt_subject_prefixes = ("read:", "declined:", "delivered:", "lido:", "recusado:", "entregue:")
+    for folder in folders_to_search:
+        try:
+            folder_items = folder.Items
+            total_items = folder_items.Count
+        except Exception as e:
+            print(f"[ERROR] Failed to access items in '{folder.Name}': {e}")
+            continue
+        print(f"Checking {total_items} item(s) in '{folder.Name}'...")
+        for item in folder_items:
+            try:
+                item_class = str(item.MessageClass)
+            except Exception:
+                continue
+            if not (item_class.startswith("REPORT.IPM.Note.IPNRN") or item_class.startswith("REPORT.IPM.Note.IPNNRN")
+                    or item_class.startswith("IPM.Note.IPNRN") or item_class.startswith("IPM.Note.IPNNRN")):
+                # Diagnostics: if the subject looks like a receipt (e.g.
+                # "Read:"/"Declined:" prefix) but the MessageClass didn't
+                # match what we expect, keep it to show the user — helps
+                # quickly spot if Outlook is using a different class than
+                # documented.
+                try:
+                    item_subject = str(item.Subject or "")
+                except Exception:
+                    item_subject = ""
+                if item_subject.strip().lower().startswith(receipt_subject_prefixes):
+                    unrecognized_candidates.append((item_subject, item_class))
+                continue
+            try:
+                entry_id = item.EntryID
+            except Exception:
+                entry_id = None
+            if entry_id is not None and entry_id in seen_ids:
+                continue
+            if entry_id is not None:
+                seen_ids.add(entry_id)
+            receipt_items.append(item)
+
+    if not receipt_items:
+        print("No read receipts found in the checked mailboxes.")
+        if unrecognized_candidates:
+            print("\n[DIAGNOSTICS] Found item(s) with a receipt-like subject, but with a")
+            print("MessageClass different from expected (IPM.Note.IPNRN/IPNNRN):")
+            for item_subject, item_class in unrecognized_candidates:
+                print(f"  - Subject: {item_subject!r} | MessageClass: {item_class!r}")
 
     confirmed_count = 0
     declined_count = 0
     for item in receipt_items:
         try:
             msg_class = str(item.MessageClass)
-            reader_email = str(getattr(item, "SenderEmailAddress", "") or "").strip().lower()
+            reader_email = get_receipt_smtp_address(item)
             original_subject = extract_original_subject_from_receipt(str(item.Subject or ""))
-            read_date = str(item.ReceivedTime)
-        except Exception:
+        except Exception as e:
+            print(f"[DIAGNOSTICS] Failed to process a receipt (item skipped): {e}")
             continue
 
-        declined = msg_class.startswith("REPORT.IPM.Note.IPNNRN")
+        # Report items (read/decline receipts) sometimes don't expose
+        # ReceivedTime the same way a regular e-mail does; fall back to
+        # CreationTime and, at worst, leave it blank instead of discarding
+        # the whole receipt. The value is formatted as DD/MM/YYYY HH:MM for
+        # readability in the log.
+        try:
+            read_date = item.ReceivedTime.strftime("%d/%m/%Y %H:%M")
+        except Exception:
+            try:
+                read_date = item.CreationTime.strftime("%d/%m/%Y %H:%M")
+            except Exception:
+                read_date = ""
+
+        declined = msg_class.startswith("REPORT.IPM.Note.IPNNRN") or msg_class.startswith("IPM.Note.IPNNRN")
 
         mask = (
             (log_df["Email"].astype(str).str.strip().str.lower() == reader_email)
@@ -905,14 +1069,24 @@ def check_read_receipts(namespace):
             & (log_df["Subject"].astype(str).str.strip().str.lower() == original_subject.strip().lower())
         )
         if not mask.any():
-            # Fallback: if the subject doesn't match (e.g., old log without
-            # that column filled in), try matching by e-mail only within
-            # this log.
+            # Fallback: only kicks in when the log row itself has no subject
+            # recorded (e.g., a log generated by an older run of this script,
+            # before the "Subject" column existed). In that case, match by
+            # e-mail only within this log. Do NOT use this fallback when the
+            # log row already has a different subject than the receipt: that
+            # would let a receipt from an earlier send (e.g. "test 7") be
+            # incorrectly attributed to a different send to the same
+            # recipient (e.g. "test 9"), inflating the confirmation count.
             mask = (
                 (log_df["Email"].astype(str).str.strip().str.lower() == reader_email)
                 & (log_df["Status"].astype(str).str.strip() == "Sent")
+                & (log_df["Subject"].astype(str).str.strip() == "")
             )
         if not mask.any():
+            print(
+                f"[DIAGNOSTICS] Receipt received from '{reader_email}' (receipt subject: "
+                f"'{original_subject}') did not match any row in the log (with Status='Sent')."
+            )
             continue
 
         new_status = "Declined" if declined else "Confirmed"
@@ -978,15 +1152,15 @@ def main():
 
     subject = input("E-mail subject: ").strip()
     request_read_receipt = ask_read_receipt()
-    print()
+    generate_log, log_path = ask_generate_log(spreadsheet)
 
     if not show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path, template_path, subject,
-                                     request_read_receipt):
+                                     request_read_receipt, generate_log, log_path):
         print("Operation cancelled by the user.")
         return
 
     send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_template, subject,
-                request_read_receipt)
+                request_read_receipt, generate_log, log_path)
 
 
 if __name__ == "__main__":
