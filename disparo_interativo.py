@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Assistente interativo de disparo de e-mails personalizados via Outlook
-clássico, usando a caixa compartilhada rfp.bts@ereadvisory.com como
-remetente (via SentOnBehalfOfName + resolução no GAL do Exchange).
+clássico.
 
-Este script mantém integralmente a lógica de resolução da caixa
-compartilhada validada em "Script de Envio.py" (ver HANDOFF_disparo_emails.md,
-gotchas 2 e 3): SentOnBehalfOfName + CreateRecipient() com verificação de
-AddressEntry.Type == "EX" e fallback pelo nome de exibição no GAL.
+O script detecta as contas e caixas compartilhadas disponíveis no perfil do
+Outlook do usuário, pergunta qual delas deve ser usada como remetente e, se
+for uma caixa compartilhada, oferece a opção de enviar "em nome de" ela
+(via SentOnBehalfOfName + resolução no catálogo de endereços do Exchange).
+Também pergunta um documento Word com o padrão de assinatura (a formatação
+do Word é preservada ao converter para HTML) e, opcionalmente, uma imagem de
+logo para incluir na assinatura.
 
 Uso: python disparo_interativo.py
 """
@@ -20,13 +22,6 @@ import subprocess
 import sys
 import time
 
-# ==================== CONFIGURAÇÃO FIXA (NÃO ALTERAR) ====================
-# A caixa de envio real (remetente, via SentOnBehalfOfName) é sempre esta,
-# independentemente do e-mail que o usuário informar na Etapa 2. A Etapa 2
-# é puramente informativa/log de quem disparou a campanha.
-CONTA_ENVIO = "rfp.bts@ereadvisory.com"
-NOME_EXIBICAO_FALLBACK = "rfp bts"  # nome de exibição no GAL, usado como fallback
-# ===========================================================================
 
 def limpar_caminho(texto):
     """Aceita o caminho colado 'cru', entre aspas ("..."/'...') ou entre
@@ -40,17 +35,6 @@ def limpar_caminho(texto):
     return texto
 
 
-BLOCO_ASSINATURA_PADRAO = """<p>Atenciosamente,</p>
-<p><b>Priscila Milfano</b><br>
-<p><b>Expansão & Gestão de Portfólio</b><br>
-Cell BR: +55 11 94003-6409</p>
-<p>Condomínio Edifício Aliança<br>
-Rua Verbo Divino, 1547 | 13º andar<br>
-São Paulo/SP &ndash; CEP 04719-002<br>
-CRECI 32378-J</p>
-<p><img src="cid:logo_assinatura" width="185" height="48"></p>"""
-
-
 # ==================== ETAPA 1: VERIFICAÇÃO DE AMBIENTE ====================
 
 def verificar_dependencias():
@@ -59,6 +43,7 @@ def verificar_dependencias():
         "pandas": "pandas",
         "openpyxl": "openpyxl",
         "docx": "python-docx",
+        "PIL": "Pillow",
     }
     faltando = []
     for modulo, pacote_pip in pacotes.items():
@@ -72,7 +57,7 @@ def verificar_dependencias():
         subprocess.run([sys.executable, "-m", "pip", "install", *faltando], check=True)
         print(f"[Ambiente] Instalado(s): {', '.join(faltando)}")
     else:
-        print("[Ambiente] pywin32, pandas e openpyxl já estão instalados.")
+        print("[Ambiente] Todas as dependências já estão instaladas.")
 
 
 def outlook_classico_em_execucao():
@@ -146,7 +131,7 @@ def verificar_outlook_classico():
 
 def executar_verificacao_ambiente():
     print("=" * 70)
-    print("ETAPA 1/5 - Verificação de ambiente")
+    print("ETAPA 1/6 - Verificação de ambiente")
     print("=" * 70)
     verificar_dependencias()
     verificar_outlook_classico()
@@ -155,16 +140,34 @@ def executar_verificacao_ambiente():
 
 # ==================== ETAPA 2: E-MAIL DO USUÁRIO (INFORMATIVO) =============
 
-def perguntar_email_usuario():
+def perguntar_email_usuario(namespace):
     print("=" * 70)
-    print("ETAPA 2/5 - Identificação do usuário (apenas para log)")
+    print("ETAPA 2/6 - Identificação do usuário (apenas para log)")
     print("=" * 70)
     regex_email = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+    contas = [c["rotulo"] for c in listar_caixas_disponiveis(namespace) if c["tipo"] == "conta"]
+    if contas:
+        print("Emails configurados:")
+        for i, email in enumerate(contas, start=1):
+            print(f"  {i}. {email}")
+        while True:
+            escolha = input("Qual deve ser usado (número da lista ou digite o e-mail): ").strip()
+            if escolha.isdigit() and 1 <= int(escolha) <= len(contas):
+                email = contas[int(escolha) - 1]
+                print(f"[Info] E-mail do usuário registrado para log: {email}")
+                print()
+                return email
+            if regex_email.match(escolha):
+                print(f"[Info] E-mail do usuário registrado para log: {escolha}")
+                print()
+                return escolha
+            print("Escolha inválida. Digite o número de uma opção da lista ou um e-mail válido.")
+
     while True:
-        email = input("Qual é o seu e-mail principal (ex: john.doe@ereadvisory.com)? ").strip()
+        email = input("Qual é o seu e-mail principal (ex: john.doe@company.com)? ").strip()
         if regex_email.match(email):
             print(f"[Info] E-mail do usuário registrado para log: {email}")
-            print(f"[Info] O remetente real do disparo continua sendo: {CONTA_ENVIO} (fixo, não afetado por essa resposta)")
             print()
             return email
         print("E-mail inválido. Tente novamente.")
@@ -237,14 +240,13 @@ def validar_coluna_dados(df, coluna, rotulo):
     if n_multiplos > 0:
         print(f"[AVISO] A coluna '{coluna}' ({rotulo}) tem {n_multiplos} célula(s) com múltiplos valores")
         print("        separados por '/'. Essas linhas precisam ser explodidas em linhas")
-        print("        separadas antes do envio para manter a personalização individual")
-        print("        (ver HANDOFF_disparo_emails.md, item 6). Elas serão puladas no envio")
-        print("        automático se não forem corrigidas na planilha.")
+        print("        separadas antes do envio para manter a personalização individual.")
+        print("        Elas serão puladas no envio automático se não forem corrigidas na planilha.")
 
 
 def selecionar_planilha():
     print("=" * 70)
-    print("ETAPA 3/5 - Seleção da planilha de contatos")
+    print("ETAPA 4/6 - Seleção da planilha de contatos")
     print("=" * 70)
     import pandas as pd
 
@@ -269,37 +271,343 @@ def selecionar_planilha():
     }
 
 
-# ==================== ETAPA 4: IMAGEM DE ASSINATURA =========================
+# ==================== ETAPA 4: SELEÇÃO DA CAIXA DE ENVIO ====================
+# O script detecta as contas completas e as caixas compartilhadas/pastas
+# adicionais disponíveis no perfil do Outlook e pergunta ao usuário qual
+# delas deve ser usada como remetente. Se a escolha for uma caixa
+# compartilhada (não uma conta completa do próprio usuário), pergunta se o
+# envio deve ser feito "em nome de" ela (SentOnBehalfOfName), resolvendo o
+# endereço no catálogo de endereços do Exchange (GAL). Se o usuário preferir
+# não usar essa permissão, o envio segue pela conta padrão do Outlook.
 
-def perguntar_caminho_logo():
+def listar_caixas_disponiveis(namespace):
+    caixas = []
+    try:
+        for acc in namespace.Accounts:
+            try:
+                email = acc.SmtpAddress
+            except Exception:
+                continue
+            if email:
+                caixas.append({"rotulo": email, "tipo": "conta", "conta_obj": acc})
+    except Exception:
+        pass
+
+    rotulos_conhecidos = {c["rotulo"].lower() for c in caixas}
+    try:
+        for folder in namespace.Folders:
+            try:
+                nome = (folder.Name or "").strip()
+            except Exception:
+                continue
+            if nome and nome.lower() not in rotulos_conhecidos:
+                caixas.append({"rotulo": nome, "tipo": "pasta_adicional", "conta_obj": None})
+                rotulos_conhecidos.add(nome.lower())
+    except Exception:
+        pass
+
+    return caixas
+
+
+def caixa_configurada_no_perfil(namespace, alvo):
+    """Verifica se 'alvo' (e-mail ou nome de exibição) aparece registrado
+    como conta completa ou como pasta adicional (caixa compartilhada/Full
+    Access) no perfil atual do Outlook."""
+    alvo_lower = alvo.strip().lower()
+
+    try:
+        for acc in namespace.Accounts:
+            try:
+                if acc.SmtpAddress and acc.SmtpAddress.strip().lower() == alvo_lower:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    try:
+        for folder in namespace.Folders:
+            try:
+                if alvo_lower in (folder.Name or "").strip().lower():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
+
+
+def resolver_endereco_envio(namespace, nome_ou_email_inicial):
+    def resolver(valor):
+        rec = namespace.CreateRecipient(valor)
+        rec.Resolve()
+        if not rec.Resolved:
+            return None
+        tipo = rec.AddressEntry.Type
+        print(f"  Tentativa '{valor}' -> Resolvido | Tipo: {tipo} | Address: {rec.Address}")
+        return rec, tipo
+
+    print("Resolvendo endereço de envio contra o catálogo de endereços...")
+    resultado = resolver(nome_ou_email_inicial)
+
+    if resultado is None or resultado[1] != "EX":
+        nome_fallback = input(
+            f"Não foi possível resolver '{nome_ou_email_inicial}' como endereço nativo do Exchange.\n"
+            "Digite o nome de exibição exato como aparece na busca do catálogo de endereços "
+            "(ou apenas Enter para tentar de novo com o mesmo valor): "
+        ).strip()
+        if nome_fallback:
+            resultado = resolver(nome_fallback)
+
+    if resultado is None:
+        raise Exception(
+            f"Não foi possível resolver '{nome_ou_email_inicial}' no catálogo de endereços. "
+            "Confirme o nome exato como aparece na busca do catálogo (GAL)."
+        )
+
+    rec, tipo = resultado
+    if tipo != "EX":
+        print(f"\nATENÇÃO: o endereço resolvido é do tipo '{tipo}', não 'EX' (Exchange nativo).")
+        print("Isso pode causar erro de permissão ao usar 'Enviar em nome de'.\n")
+
+    return rec.Address
+
+
+def perguntar_caixa_envio(namespace):
     print("=" * 70)
-    print("ETAPA 4/5 - Imagem de assinatura")
+    print("ETAPA 3/6 - Seleção da caixa de envio")
+    print("=" * 70)
+    caixas = listar_caixas_disponiveis(namespace)
+
+    print("Caixas detectadas no perfil do Outlook:")
+    for i, caixa in enumerate(caixas, start=1):
+        rotulo_tipo = "conta completa" if caixa["tipo"] == "conta" else "pasta adicional / possível caixa compartilhada"
+        print(f"  {i}. {caixa['rotulo']} ({rotulo_tipo})")
+
+    while True:
+        escolha = input("Qual caixa deve ser usada como remetente (número da lista ou digite o e-mail/nome): ").strip()
+        if escolha.isdigit() and 1 <= int(escolha) <= len(caixas):
+            caixa_escolhida = caixas[int(escolha) - 1]
+            break
+        if escolha:
+            caixa_escolhida = {"rotulo": escolha, "tipo": "manual", "conta_obj": None}
+            break
+        print("Valor vazio. Digite o número de uma opção da lista ou um e-mail/nome válido.")
+
+    if caixa_escolhida["tipo"] == "conta":
+        print(f"\n'{caixa_escolhida['rotulo']}' é uma conta completa configurada no perfil.")
+        print("O envio usará essa conta diretamente, sem necessidade de 'Enviar em nome de'.\n")
+        return {"modo": "conta_completa", "endereco_envio": caixa_escolhida["rotulo"], "conta_obj": caixa_escolhida["conta_obj"]}
+
+    print(f"\nVerificando se '{caixa_escolhida['rotulo']}' está configurada no perfil...")
+    if caixa_configurada_no_perfil(namespace, caixa_escolhida["rotulo"]):
+        print("Caixa compartilhada/pasta adicional detectada no perfil.")
+    else:
+        print("Não foi detectada como pasta adicional/conta no perfil (ainda pode funcionar via")
+        print("permissão 'Enviar em nome de', desde que ela tenha sido concedida no Exchange).")
+
+    resposta = input(
+        f"Deseja enviar os e-mails em nome de '{caixa_escolhida['rotulo']}' (via 'Enviar em nome de')? (s/n): "
+    ).strip().lower()
+    if resposta != "s":
+        print("Ok, o envio usará a conta padrão do Outlook (sem 'Enviar em nome de').\n")
+        return {"modo": "conta_completa", "endereco_envio": None, "conta_obj": None}
+
+    endereco_resolvido = resolver_endereco_envio(namespace, caixa_escolhida["rotulo"])
+    print(f"\nEndereço final resolvido para o envio: {endereco_resolvido}\n")
+    return {"modo": "caixa_compartilhada", "endereco_envio": endereco_resolvido, "conta_obj": None}
+
+
+# ==================== ETAPA 5: ASSINATURA (DOCX) E LOGO ======================
+# O padrão de assinatura é fornecido pelo usuário como um documento Word. A
+# conversão para HTML é feita diretamente a partir das runs do python-docx
+# (não usa uma biblioteca de simplificação como o mammoth), para preservar
+# fielmente negrito, itálico, sublinhado, cor exata do texto e imagens
+# embutidas no próprio documento (ex.: logo já colada na assinatura).
+
+_ALINHAMENTO_CSS = {
+    1: "center",  # WD_ALIGN_PARAGRAPH.CENTER
+    2: "right",   # WD_ALIGN_PARAGRAPH.RIGHT
+    3: "justify",  # WD_ALIGN_PARAGRAPH.JUSTIFY
+}
+
+
+_EMU_POR_PIXEL = 9525  # EMU por pixel a 96 DPI (padrão do Word/Office)
+
+
+def _extrair_imagens_run(run):
+    import base64
+    from docx.oxml.ns import qn
+
+    imagens_html = []
+    for drawing in run._element.findall(".//" + qn("w:drawing")):
+        largura_px = altura_px = None
+        extent = drawing.find(".//" + qn("wp:extent"))
+        if extent is not None:
+            cx = extent.get("cx")
+            cy = extent.get("cy")
+            if cx and cy:
+                try:
+                    largura_px = round(int(cx) / _EMU_POR_PIXEL)
+                    altura_px = round(int(cy) / _EMU_POR_PIXEL)
+                except Exception:
+                    largura_px = altura_px = None
+
+        for blip in drawing.findall(".//" + qn("a:blip")):
+            r_id = blip.get(qn("r:embed"))
+            if not r_id:
+                continue
+            try:
+                image_part = run.part.related_parts[r_id]
+                b64 = base64.b64encode(image_part.blob).decode("ascii")
+                dimensoes = f' width="{largura_px}" height="{altura_px}"' if largura_px and altura_px else ""
+                imagens_html.append(f'<img src="data:{image_part.content_type};base64,{b64}"{dimensoes}>')
+            except Exception:
+                continue
+    return imagens_html
+
+
+def _run_para_html(run):
+    from html import escape
+
+    partes = []
+    texto = run.text or ""
+    if texto:
+        texto_html = escape(texto).replace("\n", "<br>")
+        estilos = []
+        cor = None
+        try:
+            if run.font.color is not None and run.font.color.type is not None and run.font.color.rgb is not None:
+                cor = str(run.font.color.rgb)
+        except Exception:
+            pass
+        if cor:
+            estilos.append(f"color:#{cor}")
+        try:
+            if run.font.size is not None:
+                estilos.append(f"font-size:{run.font.size.pt}pt")
+        except Exception:
+            pass
+        if run.bold:
+            texto_html = f"<strong>{texto_html}</strong>"
+        if run.italic:
+            texto_html = f"<em>{texto_html}</em>"
+        if run.underline:
+            texto_html = f"<u>{texto_html}</u>"
+        if estilos:
+            texto_html = f'<span style="{";".join(estilos)}">{texto_html}</span>'
+        partes.append(texto_html)
+    partes.extend(_extrair_imagens_run(run))
+    return "".join(partes)
+
+
+def _extrair_paragrafos_docx_html(caminho):
+    """Converte cada parágrafo de um .docx para HTML preservando negrito,
+    itálico, sublinhado, cor e tamanho de fonte de cada trecho de texto, além
+    de imagens embutidas (com a largura/altura originais do documento)."""
+    from docx import Document
+
+    doc = Document(caminho)
+    paragrafos_html = []
+    for paragrafo in doc.paragraphs:
+        conteudo = "".join(_run_para_html(run) for run in paragrafo.runs)
+        if not conteudo.strip():
+            continue
+        alinhamento = _ALINHAMENTO_CSS.get(paragrafo.alignment)
+        estilo = f' style="text-align:{alinhamento}"' if alinhamento else ""
+        paragrafos_html.append(f"<p{estilo}>{conteudo}</p>")
+    return paragrafos_html
+
+
+def extrair_assinatura_docx(caminho):
+    return "\n".join(_extrair_paragrafos_docx_html(caminho))
+
+
+def perguntar_caminho_assinatura():
+    print("=" * 70)
+    print("ETAPA 5/6 - Padrão de assinatura (Word) e logo")
     print("=" * 70)
     while True:
-        caminho = limpar_caminho(input("Caminho do arquivo de imagem da logo/assinatura (PNG/JPG): "))
+        caminho = limpar_caminho(input("Caminho do documento Word (.docx) com o padrão de assinatura: "))
+        if not os.path.exists(caminho) or not caminho.lower().endswith(".docx"):
+            print("Arquivo não encontrado ou formato inválido (use .docx). Tente novamente.")
+            continue
+        if os.path.getsize(caminho) == 0:
+            print("O arquivo está vazio (0 bytes). Abra-o, adicione o conteúdo e salve novamente. Tente outro caminho.")
+            continue
+        try:
+            assinatura_html = extrair_assinatura_docx(caminho)
+        except Exception as e:
+            print(f"Não foi possível ler o documento ({e}). Tente novamente.")
+            continue
+        if not assinatura_html.strip():
+            print("O documento de assinatura está vazio. Tente novamente.")
+            continue
+        return caminho, assinatura_html
+
+
+def assinatura_ja_tem_imagem(assinatura_html):
+    return "<img" in assinatura_html
+
+
+def perguntar_logo(assinatura_html):
+    if assinatura_ja_tem_imagem(assinatura_html):
+        print("[Info] O documento de assinatura já contém uma imagem embutida (extraída com o")
+        print("tamanho original do Word). A etapa de logo externa foi pulada para evitar duplicidade.")
+        print()
+        return None
+
+    resposta = input("Existe uma imagem de logo da empresa para incluir na assinatura? (s/n): ").strip().lower()
+    if resposta != "s":
+        print()
+        return None
+    while True:
+        caminho = limpar_caminho(input("Caminho do arquivo de imagem da logo (PNG/JPG): "))
         if os.path.exists(caminho) and caminho.lower().endswith((".png", ".jpg", ".jpeg")):
             print()
             return caminho
         print("Arquivo não encontrado ou formato inválido (use .png/.jpg/.jpeg). Tente novamente.")
 
 
-# ==================== ETAPA 5: TEMPLATE DO CORPO ============================
+LARGURA_MAXIMA_LOGO_PX = 180
+ALTURA_MAXIMA_LOGO_PX = 60
+
+
+def calcular_dimensoes_logo(caminho, largura_max=LARGURA_MAXIMA_LOGO_PX, altura_max=ALTURA_MAXIMA_LOGO_PX):
+    """Lê o tamanho real da imagem e devolve dimensões reduzidas
+    proporcionalmente para caber dentro do limite (nunca aumenta a imagem,
+    só evita que uma logo em alta resolução apareça gigante na assinatura)."""
+    from PIL import Image
+
+    try:
+        with Image.open(caminho) as img:
+            largura, altura = img.size
+    except Exception:
+        return None
+    if largura <= 0 or altura <= 0:
+        return None
+
+    fator = min(1.0, largura_max / largura, altura_max / altura)
+    return max(1, round(largura * fator)), max(1, round(altura * fator))
+
+
+def montar_assinatura_final(assinatura_html, logo_path):
+    if logo_path:
+        dimensoes = calcular_dimensoes_logo(logo_path)
+        atributos = f' width="{dimensoes[0]}" height="{dimensoes[1]}"' if dimensoes else ""
+        return f'{assinatura_html}\n<p><img src="cid:logo_assinatura"{atributos}></p>'
+    return assinatura_html
+
+
+# ==================== ETAPA 6: TEMPLATE DO CORPO ============================
 # O template contém APENAS o corpo específico da mensagem (sem saudação e
 # sem assinatura). A saudação "Prezado(a) <Nome>," é gerada automaticamente
 # pelo script a partir da coluna de nomes da planilha, e a assinatura é
-# sempre o bloco fixo BLOCO_ASSINATURA_PADRAO (nunca muda, nunca vem do
-# template).
+# sempre a extraída do documento Word na etapa anterior.
 
 def extrair_texto_docx(caminho):
-    from docx import Document
-
-    doc = Document(caminho)
-    paragrafos = []
-    for para in doc.paragraphs:
-        texto = para.text.strip()
-        if texto:
-            paragrafos.append(f"<p>{texto}</p>")
-    return "\n".join(paragrafos)
+    return "\n".join(_extrair_paragrafos_docx_html(caminho))
 
 
 def extrair_corpo_texto_ou_html(caminho):
@@ -320,14 +628,14 @@ def envolver_em_html(texto):
     )
 
 
-def selecionar_template():
+def selecionar_template(assinatura_html):
     print("=" * 70)
-    print("ETAPA 5/5 - Template do corpo do e-mail")
+    print("ETAPA 6/6 - Template do corpo do e-mail")
     print("=" * 70)
     print("O template deve conter apenas o corpo específico da mensagem (sem")
     print("saudação inicial e sem assinatura) — a saudação é gerada")
     print("automaticamente a partir do nome na planilha, e a assinatura é")
-    print("sempre o modelo fixo da empresa.")
+    print("sempre a extraída do documento Word informado na etapa anterior.")
     while True:
         caminho = limpar_caminho(input("Caminho do template do corpo do e-mail (.txt, .html ou .docx): "))
         if not os.path.exists(caminho) or not caminho.lower().endswith((".txt", ".html", ".htm", ".docx")):
@@ -349,47 +657,10 @@ def selecionar_template():
             continue
         break
 
-    corpo_completo = f"<p>Prezado(a) {{nome}},</p>\n{corpo}\n{BLOCO_ASSINATURA_PADRAO}"
+    corpo_completo = f"<p>Prezado(a) {{nome}},</p>\n{corpo}\n{assinatura_html}"
     html_final = envolver_em_html(corpo_completo)
     print()
     return caminho, html_final
-
-
-# ==================== RESOLUÇÃO DA CAIXA COMPARTILHADA ======================
-# Lógica mantida exatamente como validada em Script de Envio.py / HANDOFF
-# (gotchas 2 e 3): resolver via CreateRecipient(), checar AddressEntry.Type
-# == "EX"; se não for, tentar de novo pelo nome de exibição no GAL.
-
-def resolver_caixa_compartilhada(namespace):
-    def resolver(nome_ou_email):
-        rec = namespace.CreateRecipient(nome_ou_email)
-        rec.Resolve()
-        if not rec.Resolved:
-            return None
-        tipo = rec.AddressEntry.Type
-        print(f"  Tentativa '{nome_ou_email}' -> Resolvido | Tipo: {tipo} | Address: {rec.Address}")
-        return rec, tipo
-
-    print("Resolvendo caixa compartilhada contra o catálogo de endereços...")
-    resultado = resolver(CONTA_ENVIO)
-
-    if resultado is None or resultado[1] != "EX":
-        print(f"Endereço via e-mail não é nativo do Exchange (ou não resolveu). "
-              f"Tentando pelo nome de exibição '{NOME_EXIBICAO_FALLBACK}'...")
-        resultado = resolver(NOME_EXIBICAO_FALLBACK)
-
-    if resultado is None:
-        raise Exception(
-            f"Não foi possível resolver {CONTA_ENVIO} nem '{NOME_EXIBICAO_FALLBACK}' no catálogo de endereços. "
-            "Confirme o nome exato como aparece na busca do GAL."
-        )
-
-    rec, tipo = resultado
-    if tipo != "EX":
-        print(f"\nATENÇÃO: o endereço resolvido é do tipo '{tipo}', não 'EX' (Exchange nativo).")
-        print("Isso provavelmente vai continuar dando erro de permissão.\n")
-
-    return rec.Address
 
 
 # ==================== RESUMO E CONFIRMAÇÃO ===================================
@@ -412,19 +683,22 @@ def perguntar_confirmacao_leitura():
     return resposta == "s"
 
 
-def mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path, assunto, solicitar_confirmacao_leitura):
+def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, template_path, assunto,
+                                solicitar_confirmacao_leitura):
     n_linhas = contar_linhas_validas(planilha["df"], planilha["coluna_nome"], planilha["coluna_email"])
+    rotulo_caixa = caixa_envio["endereco_envio"] or "conta padrão do Outlook"
     print("=" * 70)
     print("RESUMO DA CONFIGURAÇÃO")
     print("=" * 70)
     print(f"Disparado por (log):      {email_usuario}")
-    print(f"Caixa de envio (fixo):    {CONTA_ENVIO}")
+    print(f"Caixa de envio:           {rotulo_caixa}")
+    print(f"Modo de envio:            {'Enviar em nome de (caixa compartilhada)' if caixa_envio['modo'] == 'caixa_compartilhada' else 'Conta direta'}")
     print(f"Assunto:                  {assunto}")
     print(f"Planilha:                 {planilha['caminho']}")
     print(f"Aba:                      {planilha['aba']}")
     print(f"Coluna de nomes:          {planilha['coluna_nome']}")
     print(f"Coluna de e-mails:        {planilha['coluna_email']}")
-    print(f"Logo/assinatura:          {logo_path}")
+    print(f"Logo na assinatura:       {logo_path or 'Nenhuma'}")
     print(f"Template:                 {template_path}")
     print(f"Linhas válidas a enviar:  {n_linhas}")
     print(f"Confirmação de leitura:   {'Sim' if solicitar_confirmacao_leitura else 'Não'}")
@@ -435,7 +709,7 @@ def mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path
 
 # ==================== ENVIO ===================================================
 
-def enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_template, assunto,
+def enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template, assunto,
                    solicitar_confirmacao_leitura=False):
     df = planilha["df"]
     coluna_nome = planilha["coluna_nome"]
@@ -471,13 +745,18 @@ def enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_t
             mail.Subject = assunto
             mail.HTMLBody = corpo_html_template.replace("{nome}", nome)
 
-            attachment = mail.Attachments.Add(logo_path)
-            attachment.PropertyAccessor.SetProperty(
-                "http://schemas.microsoft.com/mapi/proptag/0x3712001E",
-                "logo_assinatura"
-            )
+            if logo_path:
+                attachment = mail.Attachments.Add(logo_path)
+                attachment.PropertyAccessor.SetProperty(
+                    "http://schemas.microsoft.com/mapi/proptag/0x3712001E",
+                    "logo_assinatura"
+                )
 
-            mail.SentOnBehalfOfName = endereco_resolvido
+            if caixa_envio["conta_obj"] is not None:
+                mail.SendUsingAccount = caixa_envio["conta_obj"]
+            elif caixa_envio["modo"] == "caixa_compartilhada" and caixa_envio["endereco_envio"]:
+                mail.SentOnBehalfOfName = caixa_envio["endereco_envio"]
+
             if solicitar_confirmacao_leitura:
                 mail.ReadReceiptRequested = True
             mail.Send()
@@ -513,25 +792,24 @@ def enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_t
 # destinatário receber um pedido de recibo de leitura; se ele aceitar, um
 # item de relatório (MessageClass "REPORT.IPM.Note.IPNRN" para confirmado ou
 # "REPORT.IPM.Note.IPNNRN" para recusado) chega na Caixa de Entrada da conta
-# que enviou (CONTA_ENVIO). Esta seção varre essa caixa de entrada e cruza
-# os recibos encontrados com o log de envio (por e-mail do destinatário +
-# assunto), atualizando o status de leitura de cada linha.
+# que enviou. Esta seção varre essa caixa de entrada e cruza os recibos
+# encontrados com o log de envio (por e-mail do destinatário + assunto),
+# atualizando o status de leitura de cada linha.
 
-def localizar_pasta_entrada_caixa_compartilhada(namespace):
+def localizar_pasta_entrada_caixa_compartilhada(namespace, alvo):
     """Procura, entre as caixas de correio disponíveis no perfil do Outlook
-    atual, a que corresponde à conta de envio (CONTA_ENVIO / nome de
-    exibição no GAL) e retorna sua pasta "Caixa de Entrada". Retorna None se
-    não encontrar (ex.: a caixa compartilhada não foi adicionada ao perfil)."""
+    atual, a que corresponde ao e-mail/nome de exibição informado e retorna
+    sua pasta "Caixa de Entrada". Retorna None se não encontrar (ex.: a
+    caixa compartilhada não foi adicionada ao perfil)."""
     nomes_entrada = ["Caixa de Entrada", "Inbox"]
-    alvo_email = CONTA_ENVIO.strip().lower()
-    alvo_nome = NOME_EXIBICAO_FALLBACK.strip().lower()
+    alvo_lower = alvo.strip().lower()
 
     for pasta_raiz in namespace.Folders:
         try:
             nome_raiz = (pasta_raiz.Name or "").strip().lower()
         except Exception:
             continue
-        if alvo_email in nome_raiz or alvo_nome in nome_raiz:
+        if alvo_lower in nome_raiz:
             for nome_entrada in nomes_entrada:
                 try:
                     return pasta_raiz.Folders(nome_entrada)
@@ -583,10 +861,14 @@ def verificar_confirmacoes_leitura(namespace):
     if "DataHoraLeitura" not in df_log.columns:
         df_log["DataHoraLeitura"] = ""
 
-    print(f"\nProcurando a Caixa de Entrada da conta {CONTA_ENVIO} no perfil do Outlook...")
-    pasta_entrada = localizar_pasta_entrada_caixa_compartilhada(namespace)
+    alvo = input(
+        "E-mail ou nome de exibição da caixa usada no envio original (para localizar os recibos): "
+    ).strip()
+
+    print(f"\nProcurando a Caixa de Entrada de '{alvo}' no perfil do Outlook...")
+    pasta_entrada = localizar_pasta_entrada_caixa_compartilhada(namespace, alvo)
     if pasta_entrada is None:
-        print(f"[AVISO] A caixa {CONTA_ENVIO} não foi encontrada como mailbox adicional neste perfil.")
+        print(f"[AVISO] '{alvo}' não foi encontrada como mailbox adicional neste perfil.")
         print("        Verificando na Caixa de Entrada padrão do usuário atual (pode não ser onde")
         print("        os recibos chegam, dependendo de como o Outlook está configurado).")
         pasta_entrada = namespace.GetDefaultFolder(6)  # olFolderInbox
@@ -685,25 +967,24 @@ def main():
         verificar_confirmacoes_leitura(namespace)
         return
 
-    email_usuario = perguntar_email_usuario()
+    email_usuario = perguntar_email_usuario(namespace)
+    caixa_envio = perguntar_caixa_envio(namespace)
     planilha = selecionar_planilha()
-    logo_path = perguntar_caminho_logo()
-    template_path, corpo_html_template = selecionar_template()
+    _, assinatura_docx_html = perguntar_caminho_assinatura()
+    logo_path = perguntar_logo(assinatura_docx_html)
+    assinatura_html = montar_assinatura_final(assinatura_docx_html, logo_path)
+    template_path, corpo_html_template = selecionar_template(assinatura_html)
 
     assunto = input("Assunto do e-mail: ").strip()
     solicitar_confirmacao_leitura = perguntar_confirmacao_leitura()
     print()
 
-    if not mostrar_resumo_e_confirmar(email_usuario, planilha, logo_path, template_path, assunto,
+    if not mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, template_path, assunto,
                                        solicitar_confirmacao_leitura):
         print("Operação cancelada pelo usuário.")
         return
 
-    endereco_resolvido = resolver_caixa_compartilhada(namespace)
-    print(f"\nEndereço final usado no envio: {endereco_resolvido}")
-    print(f"Enviando em nome de: {CONTA_ENVIO}\n")
-
-    enviar_emails(outlook, endereco_resolvido, planilha, logo_path, corpo_html_template, assunto,
+    enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template, assunto,
                   solicitar_confirmacao_leitura)
 
 
