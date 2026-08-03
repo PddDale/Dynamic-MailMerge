@@ -60,15 +60,24 @@ def verificar_dependencias():
         print("[Ambiente] Todas as dependências já estão instaladas.")
 
 
-def outlook_classico_em_execucao():
+def _listar_processos_em_execucao():
+    """Roda o 'tasklist' uma única vez (sem filtro) para que as duas
+    verificações de processo (Outlook clássico e Novo Outlook) não precisem
+    cada uma disparar seu próprio processo tasklist."""
     try:
         saida = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq OUTLOOK.EXE"],
+            ["tasklist"],
             capture_output=True, text=True, check=False,
         )
-        return "OUTLOOK.EXE" in saida.stdout.upper()
+        return saida.stdout.upper()
     except Exception:
-        return False
+        return ""
+
+
+def outlook_classico_em_execucao(lista_processos=None):
+    if lista_processos is None:
+        lista_processos = _listar_processos_em_execucao()
+    return "OUTLOOK.EXE" in lista_processos
 
 
 def localizar_outlook_exe():
@@ -85,29 +94,25 @@ def localizar_outlook_exe():
     return None
 
 
-def detectar_novo_outlook():
+def detectar_novo_outlook(lista_processos=None):
     """Heurística: o "Novo Outlook" roda como app empacotado (olk.exe /
     WindowsApps), não como OUTLOOK.EXE clássico. Se só existir processo de
     app empacotado e nenhum OUTLOOK.EXE, alertamos o usuário."""
-    try:
-        saida = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq olk.exe"],
-            capture_output=True, text=True, check=False,
-        )
-        return "OLK.EXE" in saida.stdout.upper()
-    except Exception:
-        return False
+    if lista_processos is None:
+        lista_processos = _listar_processos_em_execucao()
+    return "OLK.EXE" in lista_processos
 
 
 def verificar_outlook_classico():
-    if detectar_novo_outlook() and not outlook_classico_em_execucao():
+    lista_processos = _listar_processos_em_execucao()
+    if detectar_novo_outlook(lista_processos) and not outlook_classico_em_execucao(lista_processos):
         print("\n[ATENÇÃO] Foi detectado o 'Novo Outlook' em execução, que NÃO suporta")
         print("automação COM/MAPI. Por favor, feche o Novo Outlook, abra o Outlook")
         print("CLÁSSICO e pressione Enter para continuar.")
         input()
         return
 
-    if outlook_classico_em_execucao():
+    if outlook_classico_em_execucao(lista_processos):
         print("[Ambiente] Outlook clássico já está em execução.")
         return
 
@@ -140,13 +145,13 @@ def executar_verificacao_ambiente():
 
 # ==================== ETAPA 2: E-MAIL DO USUÁRIO (INFORMATIVO) =============
 
-def perguntar_email_usuario(namespace):
+def perguntar_email_usuario(caixas_disponiveis):
     print("=" * 70)
     print("ETAPA 2/6 - Identificação do usuário (apenas para log)")
     print("=" * 70)
     regex_email = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-    contas = [c["rotulo"] for c in listar_caixas_disponiveis(namespace) if c["tipo"] == "conta"]
+    contas = [c["rotulo"] for c in caixas_disponiveis if c["tipo"] == "conta"]
     if contas:
         print("Emails configurados:")
         for i, email in enumerate(contas, start=1):
@@ -235,7 +240,7 @@ def validar_coluna_dados(df, coluna, rotulo):
     elif n_vazias > 0:
         print(f"[AVISO] A coluna '{coluna}' ({rotulo}) tem {n_vazias} linha(s) vazia(s).")
 
-    multiplos = serie.dropna().astype(str).apply(lambda v: "/" in v)
+    multiplos = serie.dropna().astype(str).str.contains("/", regex=False)
     n_multiplos = int(multiplos.sum())
     if n_multiplos > 0:
         print(f"[AVISO] A coluna '{coluna}' ({rotulo}) tem {n_multiplos} célula(s) com múltiplos valores")
@@ -248,11 +253,10 @@ def selecionar_planilha():
     print("=" * 70)
     print("ETAPA 4/6 - Seleção da planilha de contatos")
     print("=" * 70)
-    import pandas as pd
 
     caminho, xls = perguntar_caminho_planilha()
     aba = escolher_aba(xls)
-    df = pd.read_excel(caminho, sheet_name=aba)
+    df = xls.parse(sheet_name=aba)
 
     print(f"\nAba '{aba}' selecionada. Agora escolha as colunas de nome e e-mail.")
     coluna_nome = escolher_coluna(df, "NOMES")
@@ -309,31 +313,20 @@ def listar_caixas_disponiveis(namespace):
     return caixas
 
 
-def caixa_configurada_no_perfil(namespace, alvo):
+def caixa_configurada_no_perfil(caixas_disponiveis, alvo):
     """Verifica se 'alvo' (e-mail ou nome de exibição) aparece registrado
     como conta completa ou como pasta adicional (caixa compartilhada/Full
-    Access) no perfil atual do Outlook."""
+    Access) no perfil atual do Outlook, reaproveitando a lista de caixas já
+    obtida em vez de percorrer o COM do Outlook de novo."""
     alvo_lower = alvo.strip().lower()
 
-    try:
-        for acc in namespace.Accounts:
-            try:
-                if acc.SmtpAddress and acc.SmtpAddress.strip().lower() == alvo_lower:
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    try:
-        for folder in namespace.Folders:
-            try:
-                if alvo_lower in (folder.Name or "").strip().lower():
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
+    for caixa in caixas_disponiveis:
+        rotulo_lower = caixa["rotulo"].strip().lower()
+        if caixa["tipo"] == "conta":
+            if rotulo_lower == alvo_lower:
+                return True
+        elif alvo_lower in rotulo_lower:
+            return True
 
     return False
 
@@ -374,11 +367,10 @@ def resolver_endereco_envio(namespace, nome_ou_email_inicial):
     return rec.Address
 
 
-def perguntar_caixa_envio(namespace):
+def perguntar_caixa_envio(namespace, caixas):
     print("=" * 70)
     print("ETAPA 3/6 - Seleção da caixa de envio")
     print("=" * 70)
-    caixas = listar_caixas_disponiveis(namespace)
 
     print("Caixas detectadas no perfil do Outlook:")
     for i, caixa in enumerate(caixas, start=1):
@@ -401,7 +393,7 @@ def perguntar_caixa_envio(namespace):
         return {"modo": "conta_completa", "endereco_envio": caixa_escolhida["rotulo"], "conta_obj": caixa_escolhida["conta_obj"]}
 
     print(f"\nVerificando se '{caixa_escolhida['rotulo']}' está configurada no perfil...")
-    if caixa_configurada_no_perfil(namespace, caixa_escolhida["rotulo"]):
+    if caixa_configurada_no_perfil(caixas, caixa_escolhida["rotulo"]):
         print("Caixa compartilhada/pasta adicional detectada no perfil.")
     else:
         print("Não foi detectada como pasta adicional/conta no perfil (ainda pode funcionar via")
@@ -747,10 +739,7 @@ def enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template
     status_leitura_inicial = "Pendente" if solicitar_confirmacao_leitura else "Não solicitada"
 
     log = []
-    for _, row in df.iterrows():
-        nome_raw = row[coluna_nome]
-        email_raw = row[coluna_email]
-
+    for nome_raw, email_raw in zip(df[coluna_nome], df[coluna_email]):
         if pd.isna(nome_raw) or pd.isna(email_raw):
             continue
         nome = str(nome_raw).strip()
@@ -1040,6 +1029,25 @@ def verificar_confirmacoes_leitura(namespace):
             for assunto_item, classe_item in candidatos_nao_reconhecidos:
                 print(f"  - Assunto: {assunto_item!r} | MessageClass: {classe_item!r}")
 
+    # Em vez de recomputar (e reescanear) as colunas Email/Assunto do log
+    # inteiro para cada recibo, construímos aqui um índice único: uma
+    # varredura O(linhas_do_log) que permite, para cada recibo, uma busca
+    # O(1) em vez de O(linhas_do_log) — importante quando o log é grande e
+    # há muitos recibos para cruzar.
+    from collections import defaultdict
+
+    indice_por_email_e_assunto = defaultdict(list)
+    indice_por_email_sem_assunto = defaultdict(list)
+    email_normalizado = df_log["Email"].astype(str).str.strip().str.lower()
+    assunto_normalizado = df_log["Assunto"].astype(str).str.strip().str.lower()
+    status_normalizado = df_log["Status"].astype(str).str.strip()
+    for idx in df_log.index[status_normalizado == "Enviado"]:
+        email_idx = email_normalizado[idx]
+        assunto_idx = assunto_normalizado[idx]
+        indice_por_email_e_assunto[(email_idx, assunto_idx)].append(idx)
+        if assunto_idx == "":
+            indice_por_email_sem_assunto[email_idx].append(idx)
+
     total_confirmados = 0
     total_recusados = 0
     for item in itens_recibo:
@@ -1066,12 +1074,10 @@ def verificar_confirmacoes_leitura(namespace):
 
         recusado = classe.startswith("REPORT.IPM.Note.IPNNRN") or classe.startswith("IPM.Note.IPNNRN")
 
-        mascara = (
-            (df_log["Email"].astype(str).str.strip().str.lower() == email_leitor)
-            & (df_log["Status"].astype(str).str.strip() == "Enviado")
-            & (df_log["Assunto"].astype(str).str.strip().str.lower() == assunto_original.strip().lower())
+        indices_correspondentes = indice_por_email_e_assunto.get(
+            (email_leitor, assunto_original.strip().lower()), []
         )
-        if not mascara.any():
+        if not indices_correspondentes:
             # Fallback: só entra em ação quando a própria linha do log não tem
             # assunto registrado (ex.: log gerado por uma execução antiga
             # deste script, antes de a coluna "Assunto" existir). Nesse caso,
@@ -1080,12 +1086,8 @@ def verificar_confirmacoes_leitura(namespace):
             # isso faria um recibo de um disparo anterior (ex.: "teste 7")
             # ser incorretamente atribuído a um disparo diferente para o
             # mesmo destinatário (ex.: "teste 9"), inflando as confirmações.
-            mascara = (
-                (df_log["Email"].astype(str).str.strip().str.lower() == email_leitor)
-                & (df_log["Status"].astype(str).str.strip() == "Enviado")
-                & (df_log["Assunto"].astype(str).str.strip() == "")
-            )
-        if not mascara.any():
+            indices_correspondentes = indice_por_email_sem_assunto.get(email_leitor, [])
+        if not indices_correspondentes:
             print(
                 f"[DIAGNÓSTICO] Recibo recebido de '{email_leitor}' (assunto do recibo: "
                 f"'{assunto_original}') não encontrou nenhuma linha correspondente no log "
@@ -1094,8 +1096,8 @@ def verificar_confirmacoes_leitura(namespace):
             continue
 
         status_novo = "Recusada" if recusado else "Confirmada"
-        df_log.loc[mascara, "ConfirmacaoLeitura"] = status_novo
-        df_log.loc[mascara, "DataHoraLeitura"] = data_leitura
+        df_log.loc[indices_correspondentes, "ConfirmacaoLeitura"] = status_novo
+        df_log.loc[indices_correspondentes, "DataHoraLeitura"] = data_leitura
         if recusado:
             total_recusados += 1
         else:
@@ -1146,8 +1148,9 @@ def main():
         verificar_confirmacoes_leitura(namespace)
         return
 
-    email_usuario = perguntar_email_usuario(namespace)
-    caixa_envio = perguntar_caixa_envio(namespace)
+    caixas_disponiveis = listar_caixas_disponiveis(namespace)
+    email_usuario = perguntar_email_usuario(caixas_disponiveis)
+    caixa_envio = perguntar_caixa_envio(namespace, caixas_disponiveis)
     planilha = selecionar_planilha()
     _, assinatura_docx_html = perguntar_caminho_assinatura()
     logo_path = perguntar_logo(assinatura_docx_html)

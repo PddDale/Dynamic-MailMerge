@@ -60,15 +60,24 @@ def check_dependencies():
         print("[Environment] All dependencies are already installed.")
 
 
-def classic_outlook_running():
+def _list_running_processes():
+    """Runs 'tasklist' once (with no filter) so the two process checks
+    (classic Outlook and New Outlook) don't each spawn their own tasklist
+    process."""
     try:
         output = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq OUTLOOK.EXE"],
+            ["tasklist"],
             capture_output=True, text=True, check=False,
         )
-        return "OUTLOOK.EXE" in output.stdout.upper()
+        return output.stdout.upper()
     except Exception:
-        return False
+        return ""
+
+
+def classic_outlook_running(process_list=None):
+    if process_list is None:
+        process_list = _list_running_processes()
+    return "OUTLOOK.EXE" in process_list
 
 
 def locate_outlook_exe():
@@ -85,29 +94,25 @@ def locate_outlook_exe():
     return None
 
 
-def detect_new_outlook():
+def detect_new_outlook(process_list=None):
     """Heuristic: the "New Outlook" runs as a packaged app (olk.exe /
     WindowsApps), not as classic OUTLOOK.EXE. If only the packaged app
     process exists and no OUTLOOK.EXE is found, warn the user."""
-    try:
-        output = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq olk.exe"],
-            capture_output=True, text=True, check=False,
-        )
-        return "OLK.EXE" in output.stdout.upper()
-    except Exception:
-        return False
+    if process_list is None:
+        process_list = _list_running_processes()
+    return "OLK.EXE" in process_list
 
 
 def check_classic_outlook():
-    if detect_new_outlook() and not classic_outlook_running():
+    process_list = _list_running_processes()
+    if detect_new_outlook(process_list) and not classic_outlook_running(process_list):
         print("\n[WARNING] The 'New Outlook' was detected running, which does NOT support")
         print("COM/MAPI automation. Please close the New Outlook, open CLASSIC Outlook")
         print("and press Enter to continue.")
         input()
         return
 
-    if classic_outlook_running():
+    if classic_outlook_running(process_list):
         print("[Environment] Classic Outlook is already running.")
         return
 
@@ -139,13 +144,13 @@ def run_environment_check():
 
 # ==================== STEP 2: USER E-MAIL (INFORMATIONAL) ==================
 
-def ask_user_email(namespace):
+def ask_user_email(available_mailboxes):
     print("=" * 70)
     print("STEP 2/6 - User identification (for the log only)")
     print("=" * 70)
     email_regex = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-    accounts = [m["label"] for m in list_available_mailboxes(namespace) if m["type"] == "account"]
+    accounts = [m["label"] for m in available_mailboxes if m["type"] == "account"]
     if accounts:
         print("Configured e-mails:")
         for i, email in enumerate(accounts, start=1):
@@ -234,7 +239,7 @@ def validate_column_data(df, column, label):
     elif empty_count > 0:
         print(f"[WARNING] The column '{column}' ({label}) has {empty_count} empty row(s).")
 
-    multi_mask = series.dropna().astype(str).apply(lambda v: "/" in v)
+    multi_mask = series.dropna().astype(str).str.contains("/", regex=False)
     multi_count = int(multi_mask.sum())
     if multi_count > 0:
         print(f"[WARNING] The column '{column}' ({label}) has {multi_count} cell(s) with multiple values")
@@ -247,11 +252,10 @@ def select_spreadsheet():
     print("=" * 70)
     print("STEP 4/6 - Contact spreadsheet selection")
     print("=" * 70)
-    import pandas as pd
 
     path, xls = ask_spreadsheet_path()
     sheet = choose_sheet(xls)
-    df = pd.read_excel(path, sheet_name=sheet)
+    df = xls.parse(sheet_name=sheet)
 
     print(f"\nSheet '{sheet}' selected. Now choose the name and e-mail columns.")
     name_column = choose_column(df, "NAMES")
@@ -308,31 +312,20 @@ def list_available_mailboxes(namespace):
     return mailboxes
 
 
-def mailbox_configured_in_profile(namespace, target):
+def mailbox_configured_in_profile(available_mailboxes, target):
     """Checks whether 'target' (e-mail or display name) is registered as a
     full account or as an additional folder (shared mailbox/Full Access) in
-    the current Outlook profile."""
+    the current Outlook profile, reusing the already-fetched mailbox list
+    instead of walking the Outlook COM tree again."""
     target_lower = target.strip().lower()
 
-    try:
-        for acc in namespace.Accounts:
-            try:
-                if acc.SmtpAddress and acc.SmtpAddress.strip().lower() == target_lower:
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    try:
-        for folder in namespace.Folders:
-            try:
-                if target_lower in (folder.Name or "").strip().lower():
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
+    for mailbox in available_mailboxes:
+        label_lower = mailbox["label"].strip().lower()
+        if mailbox["type"] == "account":
+            if label_lower == target_lower:
+                return True
+        elif target_lower in label_lower:
+            return True
 
     return False
 
@@ -373,11 +366,10 @@ def resolve_sending_address(namespace, initial_name_or_email):
     return recipient.Address
 
 
-def ask_sending_mailbox(namespace):
+def ask_sending_mailbox(namespace, mailboxes):
     print("=" * 70)
     print("STEP 3/6 - Sending mailbox selection")
     print("=" * 70)
-    mailboxes = list_available_mailboxes(namespace)
 
     print("Mailboxes detected in the Outlook profile:")
     for i, mailbox in enumerate(mailboxes, start=1):
@@ -400,7 +392,7 @@ def ask_sending_mailbox(namespace):
         return {"mode": "full_account", "sending_address": chosen_mailbox["label"], "account_obj": chosen_mailbox["account_obj"]}
 
     print(f"\nChecking whether '{chosen_mailbox['label']}' is configured in the profile...")
-    if mailbox_configured_in_profile(namespace, chosen_mailbox["label"]):
+    if mailbox_configured_in_profile(mailboxes, chosen_mailbox["label"]):
         print("Shared mailbox/additional folder detected in the profile.")
     else:
         print("It was not detected as an additional folder/account in the profile (it may still work via")
@@ -747,10 +739,7 @@ def send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_temp
     initial_read_status = "Pending" if request_read_receipt else "Not requested"
 
     log = []
-    for _, row in df.iterrows():
-        raw_name = row[name_column]
-        raw_email = row[email_column]
-
+    for raw_name, raw_email in zip(df[name_column], df[email_column]):
         if pd.isna(raw_name) or pd.isna(raw_email):
             continue
         name = str(raw_name).strip()
@@ -1037,6 +1026,25 @@ def check_read_receipts(namespace):
             for item_subject, item_class in unrecognized_candidates:
                 print(f"  - Subject: {item_subject!r} | MessageClass: {item_class!r}")
 
+    # Instead of recomputing (and rescanning) the log's Email/Subject
+    # columns for every single receipt, build a one-time index here: a
+    # single O(log_rows) pass that lets each receipt do an O(1) lookup
+    # instead of an O(log_rows) scan — matters when the log is large and
+    # there are many receipts to cross-reference.
+    from collections import defaultdict
+
+    index_by_email_and_subject = defaultdict(list)
+    index_by_email_no_subject = defaultdict(list)
+    normalized_email = log_df["Email"].astype(str).str.strip().str.lower()
+    normalized_subject = log_df["Subject"].astype(str).str.strip().str.lower()
+    normalized_status = log_df["Status"].astype(str).str.strip()
+    for idx in log_df.index[normalized_status == "Sent"]:
+        email_idx = normalized_email[idx]
+        subject_idx = normalized_subject[idx]
+        index_by_email_and_subject[(email_idx, subject_idx)].append(idx)
+        if subject_idx == "":
+            index_by_email_no_subject[email_idx].append(idx)
+
     confirmed_count = 0
     declined_count = 0
     for item in receipt_items:
@@ -1063,12 +1071,10 @@ def check_read_receipts(namespace):
 
         declined = msg_class.startswith("REPORT.IPM.Note.IPNNRN") or msg_class.startswith("IPM.Note.IPNNRN")
 
-        mask = (
-            (log_df["Email"].astype(str).str.strip().str.lower() == reader_email)
-            & (log_df["Status"].astype(str).str.strip() == "Sent")
-            & (log_df["Subject"].astype(str).str.strip().str.lower() == original_subject.strip().lower())
+        matching_indices = index_by_email_and_subject.get(
+            (reader_email, original_subject.strip().lower()), []
         )
-        if not mask.any():
+        if not matching_indices:
             # Fallback: only kicks in when the log row itself has no subject
             # recorded (e.g., a log generated by an older run of this script,
             # before the "Subject" column existed). In that case, match by
@@ -1077,12 +1083,8 @@ def check_read_receipts(namespace):
             # would let a receipt from an earlier send (e.g. "test 7") be
             # incorrectly attributed to a different send to the same
             # recipient (e.g. "test 9"), inflating the confirmation count.
-            mask = (
-                (log_df["Email"].astype(str).str.strip().str.lower() == reader_email)
-                & (log_df["Status"].astype(str).str.strip() == "Sent")
-                & (log_df["Subject"].astype(str).str.strip() == "")
-            )
-        if not mask.any():
+            matching_indices = index_by_email_no_subject.get(reader_email, [])
+        if not matching_indices:
             print(
                 f"[DIAGNOSTICS] Receipt received from '{reader_email}' (receipt subject: "
                 f"'{original_subject}') did not match any row in the log (with Status='Sent')."
@@ -1090,8 +1092,8 @@ def check_read_receipts(namespace):
             continue
 
         new_status = "Declined" if declined else "Confirmed"
-        log_df.loc[mask, "ReadReceipt"] = new_status
-        log_df.loc[mask, "ReadAt"] = read_date
+        log_df.loc[matching_indices, "ReadReceipt"] = new_status
+        log_df.loc[matching_indices, "ReadAt"] = read_date
         if declined:
             declined_count += 1
         else:
@@ -1142,8 +1144,9 @@ def main():
         check_read_receipts(namespace)
         return
 
-    user_email = ask_user_email(namespace)
-    sending_mailbox = ask_sending_mailbox(namespace)
+    available_mailboxes = list_available_mailboxes(namespace)
+    user_email = ask_user_email(available_mailboxes)
+    sending_mailbox = ask_sending_mailbox(namespace, available_mailboxes)
     spreadsheet = select_spreadsheet()
     _, signature_docx_html = ask_signature_path()
     logo_path = ask_logo(signature_docx_html)
