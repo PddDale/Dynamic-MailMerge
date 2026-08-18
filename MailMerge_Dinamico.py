@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import defaultdict
 
 
 def limpar_caminho(texto):
@@ -77,7 +78,10 @@ def _listar_processos_em_execucao():
 def outlook_classico_em_execucao(lista_processos=None):
     if lista_processos is None:
         lista_processos = _listar_processos_em_execucao()
-    return "OUTLOOK.EXE" in lista_processos
+    # Âncora no início da linha (nome da imagem é a 1ª coluna do tasklist)
+    # para não confundir com um processo de terceiros cujo nome apenas
+    # contenha "OUTLOOK.EXE" como substring (ex.: "SOMEOUTLOOK.EXE").
+    return re.search(r"(?m)^OUTLOOK\.EXE\s", lista_processos) is not None
 
 
 def localizar_outlook_exe():
@@ -100,7 +104,7 @@ def detectar_novo_outlook(lista_processos=None):
     app empacotado e nenhum OUTLOOK.EXE, alertamos o usuário."""
     if lista_processos is None:
         lista_processos = _listar_processos_em_execucao()
-    return "OLK.EXE" in lista_processos
+    return re.search(r"(?m)^OLK\.EXE\s", lista_processos) is not None
 
 
 def verificar_outlook_classico():
@@ -393,7 +397,11 @@ def perguntar_caixa_envio(namespace, caixas):
         return {"modo": "conta_completa", "endereco_envio": caixa_escolhida["rotulo"], "conta_obj": caixa_escolhida["conta_obj"]}
 
     print(f"\nVerificando se '{caixa_escolhida['rotulo']}' está configurada no perfil...")
-    if caixa_configurada_no_perfil(caixas, caixa_escolhida["rotulo"]):
+    # Reconsulta o Outlook ao vivo (em vez de usar só a lista pré-carregada
+    # no início do assistente) para não reportar "não detectada" para uma
+    # caixa que o usuário adicionou ao perfil durante esta mesma sessão.
+    caixas_atuais = listar_caixas_disponiveis(namespace)
+    if caixa_configurada_no_perfil(caixas_atuais, caixa_escolhida["rotulo"]):
         print("Caixa compartilhada/pasta adicional detectada no perfil.")
     else:
         print("Não foi detectada como pasta adicional/conta no perfil (ainda pode funcionar via")
@@ -494,22 +502,76 @@ def _run_para_html(run):
     return "".join(partes)
 
 
+def _iterar_runs_do_paragrafo(paragrafo):
+    """Percorre os elementos filhos do parágrafo na ordem do documento e
+    devolve (run, url) para cada <w:r>. O atributo `paragrafo.runs` do
+    python-docx só enxerga <w:r> que sejam filhos diretos de <w:p> — runs
+    dentro de um <w:hyperlink> (exatamente o que o Word gera ao inserir um
+    hyperlink, inclusive num e-mail sublinhado como link) ficam de fora e
+    somem do HTML gerado. Aqui descemos também dentro de <w:hyperlink> e
+    resolvemos a URL do relacionamento para não perder nem o texto nem o
+    link."""
+    from docx.oxml.ns import qn
+    from docx.text.run import Run
+
+    for filho in paragrafo._p.iterchildren():
+        if filho.tag == qn("w:r"):
+            yield Run(filho, paragrafo), None
+        elif filho.tag == qn("w:hyperlink"):
+            url = None
+            r_id = filho.get(qn("r:id"))
+            if r_id:
+                try:
+                    url = paragrafo.part.rels[r_id].target_ref
+                except Exception:
+                    url = None
+            for neto in filho.iterchildren():
+                if neto.tag == qn("w:r"):
+                    yield Run(neto, paragrafo), url
+
+
 def _extrair_paragrafos_docx_html(caminho):
     """Converte cada parágrafo de um .docx para HTML preservando negrito,
     itálico, sublinhado, cor e tamanho de fonte de cada trecho de texto, além
-    de imagens embutidas (com a largura/altura originais do documento)."""
+    de imagens embutidas (com a largura/altura originais do documento) e de
+    hyperlinks (inclusive e-mails formatados como link)."""
+    from html import escape
+
     from docx import Document
 
     doc = Document(caminho)
-    paragrafos_html = []
+    itens = []  # cada item: (é_linha_em_branco, html_do_parágrafo)
     for paragrafo in doc.paragraphs:
-        conteudo = "".join(_run_para_html(run) for run in paragrafo.runs)
-        if not conteudo.strip():
-            continue
+        partes = []
+        for run, url in _iterar_runs_do_paragrafo(paragrafo):
+            html_run = _run_para_html(run)
+            if url and html_run:
+                html_run = f'<a href="{escape(url)}">{html_run}</a>'
+            partes.append(html_run)
+        conteudo = "".join(partes)
         alinhamento = _ALINHAMENTO_CSS.get(paragrafo.alignment)
-        estilo = f' style="text-align:{alinhamento}"' if alinhamento else ""
-        paragrafos_html.append(f"<p{estilo}>{conteudo}</p>")
-    return paragrafos_html
+        estilo = f' style="text-align:{alinhamento};margin:0"' if alinhamento else ' style="margin:0"'
+        if not conteudo.strip():
+            # Um parágrafo vazio no Word normalmente é uma linha em branco
+            # intencional entre blocos da assinatura (ex.: entre o
+            # nome/e-mail e o endereço). Preservamos como marcador de linha
+            # em branco em vez de descartar — do contrário a separação
+            # visual desses blocos desaparece.
+            itens.append((True, f"<p{estilo}>&nbsp;</p>"))
+        else:
+            itens.append((False, f"<p{estilo}>{conteudo}</p>"))
+
+    # Zeramos a margem padrão que navegadores/clientes de e-mail aplicam a
+    # cada <p> (que é bem maior que o espaçamento real usado no Word) e
+    # usamos as próprias linhas em branco do documento para reproduzir os
+    # espaços entre blocos — assim o e-mail final fica com o mesmo
+    # espaçamento do docx original em vez de um espaçamento "dobrado".
+    while itens and itens[0][0]:
+        itens.pop(0)
+    while itens and itens[-1][0]:
+        itens.pop()
+
+    return [html for _, html in itens]
 
 
 def extrair_assinatura_docx(caminho):
@@ -1034,10 +1096,7 @@ def verificar_confirmacoes_leitura(namespace):
     # varredura O(linhas_do_log) que permite, para cada recibo, uma busca
     # O(1) em vez de O(linhas_do_log) — importante quando o log é grande e
     # há muitos recibos para cruzar.
-    from collections import defaultdict
-
     indice_por_email_e_assunto = defaultdict(list)
-    indice_por_email_sem_assunto = defaultdict(list)
     email_normalizado = df_log["Email"].astype(str).str.strip().str.lower()
     assunto_normalizado = df_log["Assunto"].astype(str).str.strip().str.lower()
     status_normalizado = df_log["Status"].astype(str).str.strip()
@@ -1045,8 +1104,6 @@ def verificar_confirmacoes_leitura(namespace):
         email_idx = email_normalizado[idx]
         assunto_idx = assunto_normalizado[idx]
         indice_por_email_e_assunto[(email_idx, assunto_idx)].append(idx)
-        if assunto_idx == "":
-            indice_por_email_sem_assunto[email_idx].append(idx)
 
     total_confirmados = 0
     total_recusados = 0
@@ -1086,7 +1143,7 @@ def verificar_confirmacoes_leitura(namespace):
             # isso faria um recibo de um disparo anterior (ex.: "teste 7")
             # ser incorretamente atribuído a um disparo diferente para o
             # mesmo destinatário (ex.: "teste 9"), inflando as confirmações.
-            indices_correspondentes = indice_por_email_sem_assunto.get(email_leitor, [])
+            indices_correspondentes = indice_por_email_e_assunto.get((email_leitor, ""), [])
         if not indices_correspondentes:
             print(
                 f"[DIAGNÓSTICO] Recibo recebido de '{email_leitor}' (assunto do recibo: "

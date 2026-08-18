@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import defaultdict
 
 
 def clean_path(text):
@@ -77,7 +78,10 @@ def _list_running_processes():
 def classic_outlook_running(process_list=None):
     if process_list is None:
         process_list = _list_running_processes()
-    return "OUTLOOK.EXE" in process_list
+    # Anchored at line start (image name is tasklist's 1st column) so a
+    # third-party process whose name merely contains "OUTLOOK.EXE" as a
+    # substring (e.g. "SOMEOUTLOOK.EXE") isn't mistaken for the real thing.
+    return re.search(r"(?m)^OUTLOOK\.EXE\s", process_list) is not None
 
 
 def locate_outlook_exe():
@@ -100,7 +104,7 @@ def detect_new_outlook(process_list=None):
     process exists and no OUTLOOK.EXE is found, warn the user."""
     if process_list is None:
         process_list = _list_running_processes()
-    return "OLK.EXE" in process_list
+    return re.search(r"(?m)^OLK\.EXE\s", process_list) is not None
 
 
 def check_classic_outlook():
@@ -392,7 +396,11 @@ def ask_sending_mailbox(namespace, mailboxes):
         return {"mode": "full_account", "sending_address": chosen_mailbox["label"], "account_obj": chosen_mailbox["account_obj"]}
 
     print(f"\nChecking whether '{chosen_mailbox['label']}' is configured in the profile...")
-    if mailbox_configured_in_profile(mailboxes, chosen_mailbox["label"]):
+    # Re-query Outlook live (instead of only the list preloaded at the start
+    # of the assistant) so a mailbox the user added to the profile during
+    # this same session isn't misreported as "not detected".
+    current_mailboxes = list_available_mailboxes(namespace)
+    if mailbox_configured_in_profile(current_mailboxes, chosen_mailbox["label"]):
         print("Shared mailbox/additional folder detected in the profile.")
     else:
         print("It was not detected as an additional folder/account in the profile (it may still work via")
@@ -493,22 +501,75 @@ def _run_to_html(run):
     return "".join(parts)
 
 
+def _iter_paragraph_runs(paragraph):
+    """Walks the paragraph's child elements in document order and yields
+    (run, url) for every <w:r>. python-docx's `paragraph.runs` only sees
+    <w:r> elements that are direct children of <w:p> — runs nested inside a
+    <w:hyperlink> (exactly what Word produces when you insert a hyperlink,
+    including an e-mail address formatted as a link) are invisible to it and
+    disappear from the generated HTML. Here we also descend into
+    <w:hyperlink> and resolve the relationship's target URL so neither the
+    text nor the link gets lost."""
+    from docx.oxml.ns import qn
+    from docx.text.run import Run
+
+    for child in paragraph._p.iterchildren():
+        if child.tag == qn("w:r"):
+            yield Run(child, paragraph), None
+        elif child.tag == qn("w:hyperlink"):
+            url = None
+            r_id = child.get(qn("r:id"))
+            if r_id:
+                try:
+                    url = paragraph.part.rels[r_id].target_ref
+                except Exception:
+                    url = None
+            for grandchild in child.iterchildren():
+                if grandchild.tag == qn("w:r"):
+                    yield Run(grandchild, paragraph), url
+
+
 def _extract_docx_paragraphs_html(path):
     """Converts each paragraph of a .docx into HTML while preserving bold,
     italic, underline, color and font size of every text run, plus any
-    embedded images (with the document's original width/height)."""
+    embedded images (with the document's original width/height) and
+    hyperlinks (including e-mails formatted as links)."""
+    from html import escape
+
     from docx import Document
 
     doc = Document(path)
-    paragraphs_html = []
+    items = []  # each item: (is_blank_line, paragraph_html)
     for paragraph in doc.paragraphs:
-        content = "".join(_run_to_html(run) for run in paragraph.runs)
-        if not content.strip():
-            continue
+        parts = []
+        for run, url in _iter_paragraph_runs(paragraph):
+            html_run = _run_to_html(run)
+            if url and html_run:
+                html_run = f'<a href="{escape(url)}">{html_run}</a>'
+            parts.append(html_run)
+        content = "".join(parts)
         alignment = _ALIGNMENT_CSS.get(paragraph.alignment)
-        style = f' style="text-align:{alignment}"' if alignment else ""
-        paragraphs_html.append(f"<p{style}>{content}</p>")
-    return paragraphs_html
+        style = f' style="text-align:{alignment};margin:0"' if alignment else ' style="margin:0"'
+        if not content.strip():
+            # An empty Word paragraph is usually an intentional blank line
+            # between signature blocks (e.g. between the name/e-mail and the
+            # address). Preserve it as a blank-line marker instead of
+            # dropping it — otherwise that visual separation disappears.
+            items.append((True, f"<p{style}>&nbsp;</p>"))
+        else:
+            items.append((False, f"<p{style}>{content}</p>"))
+
+    # Zero out the default margin browsers/e-mail clients apply to every
+    # <p> (which is much larger than Word's actual spacing) and rely on the
+    # document's own blank-line paragraphs to reproduce the gaps between
+    # blocks — so the final e-mail keeps the same spacing as the original
+    # docx instead of a "doubled" spacing.
+    while items and items[0][0]:
+        items.pop(0)
+    while items and items[-1][0]:
+        items.pop()
+
+    return [html for _, html in items]
 
 
 def extract_signature_docx(path):
@@ -1031,10 +1092,7 @@ def check_read_receipts(namespace):
     # single O(log_rows) pass that lets each receipt do an O(1) lookup
     # instead of an O(log_rows) scan — matters when the log is large and
     # there are many receipts to cross-reference.
-    from collections import defaultdict
-
     index_by_email_and_subject = defaultdict(list)
-    index_by_email_no_subject = defaultdict(list)
     normalized_email = log_df["Email"].astype(str).str.strip().str.lower()
     normalized_subject = log_df["Subject"].astype(str).str.strip().str.lower()
     normalized_status = log_df["Status"].astype(str).str.strip()
@@ -1042,8 +1100,6 @@ def check_read_receipts(namespace):
         email_idx = normalized_email[idx]
         subject_idx = normalized_subject[idx]
         index_by_email_and_subject[(email_idx, subject_idx)].append(idx)
-        if subject_idx == "":
-            index_by_email_no_subject[email_idx].append(idx)
 
     confirmed_count = 0
     declined_count = 0
@@ -1083,7 +1139,7 @@ def check_read_receipts(namespace):
             # would let a receipt from an earlier send (e.g. "test 7") be
             # incorrectly attributed to a different send to the same
             # recipient (e.g. "test 9"), inflating the confirmation count.
-            matching_indices = index_by_email_no_subject.get(reader_email, [])
+            matching_indices = index_by_email_and_subject.get((reader_email, ""), [])
         if not matching_indices:
             print(
                 f"[DIAGNOSTICS] Receipt received from '{reader_email}' (receipt subject: "
