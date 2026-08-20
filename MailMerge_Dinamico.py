@@ -711,7 +711,13 @@ def selecionar_template(assinatura_html):
             continue
         break
 
-    corpo_completo = f"<p>Prezado(a) {{nome}},</p>\n{corpo}\n{assinatura_html}"
+    # O corpo e a assinatura vêm de documentos Word separados, cada um com
+    # suas próprias linhas em branco de início/fim já removidas (ver
+    # _extrair_paragrafos_docx_html). Sem esta linha em branco explícita
+    # aqui, a última linha do corpo ficaria colada na assinatura (ambas usam
+    # margin:0 para preservar o espaçamento interno do Word), como se a
+    # assinatura "começasse" na sua segunda linha visível.
+    corpo_completo = f'<p>Prezado(a) {{nome}},</p>\n{corpo}\n<p style="margin:0">&nbsp;</p>\n{assinatura_html}'
     html_final = envolver_em_html(corpo_completo)
     print()
     return caminho, html_final
@@ -762,6 +768,45 @@ def perguntar_geracao_log(planilha):
     return True, caminho
 
 
+def montar_linhas_tabela_contatos(df, coluna_nome, coluna_email):
+    """Monta a lista (nome, email) de todos os contatos detectados na
+    planilha (qualquer linha com nome preenchido), usando 'N/A' para as
+    linhas em que o e-mail correspondente está ausente/vazio."""
+    import pandas as pd
+
+    linhas = []
+    for nome_raw, email_raw in zip(df[coluna_nome], df[coluna_email]):
+        if pd.isna(nome_raw):
+            continue
+        nome = str(nome_raw).strip()
+        if not nome:
+            continue
+        if pd.isna(email_raw) or not str(email_raw).strip():
+            email = "N/A"
+        else:
+            email = str(email_raw).strip()
+        linhas.append((nome, email))
+    return linhas
+
+
+def imprimir_tabela_contatos(planilha):
+    linhas = montar_linhas_tabela_contatos(planilha["df"], planilha["coluna_nome"], planilha["coluna_email"])
+
+    print("\n" + "=" * 70)
+    print("NOMES E E-MAILS DETECTADOS NA PLANILHA")
+    print("=" * 70)
+    if not linhas:
+        print("Nenhum contato detectado.")
+    else:
+        largura_nome = max(len("Nome"), max(len(nome) for nome, _ in linhas))
+        largura_email = max(len("Email"), max(len(email) for _, email in linhas))
+        print(f"{'Nome'.ljust(largura_nome)}  {'Email'.ljust(largura_email)}")
+        print("-" * (largura_nome + largura_email + 2))
+        for nome, email in linhas:
+            print(f"{nome.ljust(largura_nome)}  {email.ljust(largura_email)}")
+    print("=" * 70 + "\n")
+
+
 def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, template_path, assunto,
                                 solicitar_confirmacao_leitura, gerar_log, caminho_log):
     n_linhas = contar_linhas_validas(planilha["df"], planilha["coluna_nome"], planilha["coluna_email"])
@@ -783,8 +828,21 @@ def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, 
     print(f"Confirmação de leitura:   {'Sim' if solicitar_confirmacao_leitura else 'Não'}")
     print(f"Log de envio:             {'Sim (' + caminho_log + ')' if gerar_log else 'Não'}")
     print("=" * 70)
-    resposta = input("Confirma o início do envio? (s/n): ").strip().lower()
-    return resposta == "s"
+
+    while True:
+        print("\nO que deseja fazer?")
+        print("  1. Prosseguir e enviar os e-mails")
+        print("  2. Verificar nomes e e-mails que serão usados")
+        print("  3. Cancelar o envio")
+        escolha = input("Escolha uma opção (1/2/3): ").strip()
+        if escolha == "1":
+            return True
+        if escolha == "2":
+            imprimir_tabela_contatos(planilha)
+            continue
+        if escolha == "3":
+            return False
+        print("Opção inválida. Digite 1, 2 ou 3.")
 
 
 # ==================== ENVIO ===================================================
@@ -802,12 +860,22 @@ def enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template
 
     log = []
     for nome_raw, email_raw in zip(df[coluna_nome], df[coluna_email]):
-        if pd.isna(nome_raw) or pd.isna(email_raw):
+        if pd.isna(nome_raw):
             continue
         nome = str(nome_raw).strip()
-        email = str(email_raw).strip()
-        if not nome or not email:
+        if not nome:
             continue
+
+        if pd.isna(email_raw) or not str(email_raw).strip():
+            log.append({
+                "Nome": nome, "Email": "", "Assunto": assunto,
+                "Status": "Pulado: e-mail não constatado na lista de contatos",
+                "DataHoraEnvio": "", "ConfirmacaoLeitura": "N/A", "DataHoraLeitura": "",
+            })
+            print(f"[PULADO] {nome}: e-mail não constatado na lista de contatos.")
+            continue
+
+        email = str(email_raw).strip()
         if "/" in nome or "/" in email:
             log.append({
                 "Nome": nome, "Email": email, "Assunto": assunto, "Status": "Pulado: múltiplos valores na célula",

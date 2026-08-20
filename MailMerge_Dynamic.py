@@ -710,7 +710,13 @@ def select_template(signature_html):
             continue
         break
 
-    full_body = f"<p>Dear {{name}},</p>\n{body}\n{signature_html}"
+    # The body and the signature come from separate Word documents, each
+    # with its own leading/trailing blank lines already stripped (see
+    # _extract_docx_paragraphs_html). Without this explicit blank line
+    # here, the last line of the body would be glued to the signature
+    # (both use margin:0 to preserve Word's internal spacing), making the
+    # signature look like it "starts" on its second visible line.
+    full_body = f'<p>Dear {{name}},</p>\n{body}\n<p style="margin:0">&nbsp;</p>\n{signature_html}'
     final_html = wrap_in_html(full_body)
     print()
     return path, final_html
@@ -761,6 +767,45 @@ def ask_generate_log(spreadsheet):
     return True, path
 
 
+def build_contact_table_rows(df, name_column, email_column):
+    """Builds the (name, email) list of every contact detected in the
+    spreadsheet (any row with a filled-in name), using 'N/A' for rows
+    whose matching e-mail is missing/empty."""
+    import pandas as pd
+
+    rows = []
+    for raw_name, raw_email in zip(df[name_column], df[email_column]):
+        if pd.isna(raw_name):
+            continue
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        if pd.isna(raw_email) or not str(raw_email).strip():
+            email = "N/A"
+        else:
+            email = str(raw_email).strip()
+        rows.append((name, email))
+    return rows
+
+
+def print_contact_table(spreadsheet):
+    rows = build_contact_table_rows(spreadsheet["df"], spreadsheet["name_column"], spreadsheet["email_column"])
+
+    print("\n" + "=" * 70)
+    print("NAMES AND E-MAILS DETECTED IN THE SPREADSHEET")
+    print("=" * 70)
+    if not rows:
+        print("No contacts detected.")
+    else:
+        name_width = max(len("Name"), max(len(name) for name, _ in rows))
+        email_width = max(len("Email"), max(len(email) for _, email in rows))
+        print(f"{'Name'.ljust(name_width)}  {'Email'.ljust(email_width)}")
+        print("-" * (name_width + email_width + 2))
+        for name, email in rows:
+            print(f"{name.ljust(name_width)}  {email.ljust(email_width)}")
+    print("=" * 70 + "\n")
+
+
 def show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path, template_path, subject,
                               request_read_receipt, generate_log, log_path):
     valid_count = count_valid_rows(spreadsheet["df"], spreadsheet["name_column"], spreadsheet["email_column"])
@@ -782,8 +827,21 @@ def show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path
     print(f"Read receipt:             {'Yes' if request_read_receipt else 'No'}")
     print(f"Sending log:              {'Yes (' + log_path + ')' if generate_log else 'No'}")
     print("=" * 70)
-    answer = input("Confirm the start of the sending? (y/n): ").strip().lower()
-    return answer == "y"
+
+    while True:
+        print("\nWhat would you like to do?")
+        print("  1. Proceed and send the e-mails")
+        print("  2. Check the names and e-mails that will be used")
+        print("  3. Cancel the sending")
+        choice = input("Choose an option (1/2/3): ").strip()
+        if choice == "1":
+            return True
+        if choice == "2":
+            print_contact_table(spreadsheet)
+            continue
+        if choice == "3":
+            return False
+        print("Invalid option. Type 1, 2 or 3.")
 
 
 # ==================== SENDING ===================================================
@@ -801,12 +859,22 @@ def send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_temp
 
     log = []
     for raw_name, raw_email in zip(df[name_column], df[email_column]):
-        if pd.isna(raw_name) or pd.isna(raw_email):
+        if pd.isna(raw_name):
             continue
         name = str(raw_name).strip()
-        email = str(raw_email).strip()
-        if not name or not email:
+        if not name:
             continue
+
+        if pd.isna(raw_email) or not str(raw_email).strip():
+            log.append({
+                "Name": name, "Email": "", "Subject": subject,
+                "Status": "Skipped: no matching email found in contact list",
+                "SentAt": "", "ReadReceipt": "N/A", "ReadAt": "",
+            })
+            print(f"[SKIPPED] {name}: no matching email found in contact list.")
+            continue
+
+        email = str(raw_email).strip()
         if "/" in name or "/" in email:
             log.append({
                 "Name": name, "Email": email, "Subject": subject, "Status": "Skipped: multiple values in cell",
