@@ -722,6 +722,41 @@ def select_template(signature_html):
     return path, final_html
 
 
+VALID_ATTACHMENT_EXTENSIONS = (".pptx", ".xlsx", ".docx", ".pdf")
+
+
+def ask_attachments():
+    print("=" * 70)
+    print("E-mail attachments")
+    print("=" * 70)
+    print("Accepted formats: .pptx, .xlsx, .docx, .pdf")
+    answer = input("Do you want to attach file(s) to this e-mail? (y/n): ").strip().lower()
+    if answer != "y":
+        print()
+        return []
+
+    attachments = []
+    while True:
+        path = clean_path(input(f"Path of the file to attach (attachment #{len(attachments) + 1}): "))
+        if not os.path.exists(path):
+            print("File not found. Try again.")
+            continue
+        if not path.lower().endswith(VALID_ATTACHMENT_EXTENSIONS):
+            print("Invalid format. Use .pptx, .xlsx, .docx or .pdf. Try again.")
+            continue
+        if os.path.getsize(path) == 0:
+            print("The file is empty (0 bytes). Choose another file.")
+            continue
+        attachments.append(path)
+        print(f"[OK] Attachment added: {os.path.basename(path)}")
+
+        another = input("Do you want to attach another file? (y/n): ").strip().lower()
+        if another != "y":
+            break
+    print()
+    return attachments
+
+
 # ==================== SUMMARY AND CONFIRMATION ===============================
 
 def count_valid_rows(df, name_column, email_column):
@@ -807,9 +842,11 @@ def print_contact_table(spreadsheet):
 
 
 def show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path, template_path, subject,
-                              request_read_receipt, generate_log, log_path):
+                              request_read_receipt, generate_log, log_path, attachments=None):
+    attachments = attachments or []
     valid_count = count_valid_rows(spreadsheet["df"], spreadsheet["name_column"], spreadsheet["email_column"])
     mailbox_label = sending_mailbox["sending_address"] or "default Outlook account"
+    attachments_label = ", ".join(os.path.basename(a) for a in attachments) if attachments else "None"
     print("=" * 70)
     print("CONFIGURATION SUMMARY")
     print("=" * 70)
@@ -823,6 +860,7 @@ def show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path
     print(f"E-mail column:            {spreadsheet['email_column']}")
     print(f"Logo in the signature:    {logo_path or 'None'}")
     print(f"Template:                 {template_path}")
+    print(f"Attachments:              {attachments_label}")
     print(f"Valid rows to send:       {valid_count}")
     print(f"Read receipt:             {'Yes' if request_read_receipt else 'No'}")
     print(f"Sending log:              {'Yes (' + log_path + ')' if generate_log else 'No'}")
@@ -847,7 +885,8 @@ def show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path
 # ==================== SENDING ===================================================
 
 def send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_template, subject,
-                 request_read_receipt=False, generate_log=True, log_path=None):
+                 request_read_receipt=False, generate_log=True, log_path=None, attachments=None):
+    attachments = attachments or []
     df = spreadsheet["df"]
     name_column = spreadsheet["name_column"]
     email_column = spreadsheet["email_column"]
@@ -895,6 +934,9 @@ def send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_temp
                     "http://schemas.microsoft.com/mapi/proptag/0x3712001E",
                     "signature_logo"
                 )
+
+            for attachment_path in attachments:
+                mail.Attachments.Add(attachment_path)
 
             if sending_mailbox["account_obj"] is not None:
                 mail.SendUsingAccount = sending_mailbox["account_obj"]
@@ -1277,17 +1319,19 @@ def main():
     signature_html = build_final_signature(signature_docx_html, logo_path)
     template_path, body_html_template = select_template(signature_html)
 
+    attachments = ask_attachments()
+
     subject = input("E-mail subject: ").strip()
     request_read_receipt = ask_read_receipt()
     generate_log, log_path = ask_generate_log(spreadsheet)
 
     if not show_summary_and_confirm(user_email, spreadsheet, sending_mailbox, logo_path, template_path, subject,
-                                     request_read_receipt, generate_log, log_path):
+                                     request_read_receipt, generate_log, log_path, attachments):
         print("Operation cancelled by the user.")
         return
 
     send_emails(outlook, sending_mailbox, spreadsheet, logo_path, body_html_template, subject,
-                request_read_receipt, generate_log, log_path)
+                request_read_receipt, generate_log, log_path, attachments)
 
 
 if __name__ == "__main__":

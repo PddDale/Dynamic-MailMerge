@@ -723,6 +723,41 @@ def selecionar_template(assinatura_html):
     return caminho, html_final
 
 
+EXTENSOES_ANEXO_VALIDAS = (".pptx", ".xlsx", ".docx", ".pdf")
+
+
+def perguntar_anexos():
+    print("=" * 70)
+    print("Anexos do e-mail")
+    print("=" * 70)
+    print("Formatos aceitos: .pptx, .xlsx, .docx, .pdf")
+    resposta = input("Deseja anexar arquivo(s) a este e-mail? (s/n): ").strip().lower()
+    if resposta != "s":
+        print()
+        return []
+
+    anexos = []
+    while True:
+        caminho = limpar_caminho(input(f"Caminho do arquivo a anexar ({len(anexos) + 1}º anexo): "))
+        if not os.path.exists(caminho):
+            print("Arquivo não encontrado. Tente novamente.")
+            continue
+        if not caminho.lower().endswith(EXTENSOES_ANEXO_VALIDAS):
+            print("Formato inválido. Use .pptx, .xlsx, .docx ou .pdf. Tente novamente.")
+            continue
+        if os.path.getsize(caminho) == 0:
+            print("O arquivo está vazio (0 bytes). Escolha outro arquivo.")
+            continue
+        anexos.append(caminho)
+        print(f"[OK] Anexo adicionado: {os.path.basename(caminho)}")
+
+        outro = input("Deseja anexar outro arquivo? (s/n): ").strip().lower()
+        if outro != "s":
+            break
+    print()
+    return anexos
+
+
 # ==================== RESUMO E CONFIRMAÇÃO ===================================
 
 def contar_linhas_validas(df, coluna_nome, coluna_email):
@@ -808,9 +843,11 @@ def imprimir_tabela_contatos(planilha):
 
 
 def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, template_path, assunto,
-                                solicitar_confirmacao_leitura, gerar_log, caminho_log):
+                                solicitar_confirmacao_leitura, gerar_log, caminho_log, anexos=None):
+    anexos = anexos or []
     n_linhas = contar_linhas_validas(planilha["df"], planilha["coluna_nome"], planilha["coluna_email"])
     rotulo_caixa = caixa_envio["endereco_envio"] or "conta padrão do Outlook"
+    rotulo_anexos = ", ".join(os.path.basename(a) for a in anexos) if anexos else "Nenhum"
     print("=" * 70)
     print("RESUMO DA CONFIGURAÇÃO")
     print("=" * 70)
@@ -824,6 +861,7 @@ def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, 
     print(f"Coluna de e-mails:        {planilha['coluna_email']}")
     print(f"Logo na assinatura:       {logo_path or 'Nenhuma'}")
     print(f"Template:                 {template_path}")
+    print(f"Anexos:                   {rotulo_anexos}")
     print(f"Linhas válidas a enviar:  {n_linhas}")
     print(f"Confirmação de leitura:   {'Sim' if solicitar_confirmacao_leitura else 'Não'}")
     print(f"Log de envio:             {'Sim (' + caminho_log + ')' if gerar_log else 'Não'}")
@@ -848,7 +886,8 @@ def mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, 
 # ==================== ENVIO ===================================================
 
 def enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template, assunto,
-                   solicitar_confirmacao_leitura=False, gerar_log=True, caminho_log=None):
+                   solicitar_confirmacao_leitura=False, gerar_log=True, caminho_log=None, anexos=None):
+    anexos = anexos or []
     df = planilha["df"]
     coluna_nome = planilha["coluna_nome"]
     coluna_email = planilha["coluna_email"]
@@ -896,6 +935,9 @@ def enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template
                     "http://schemas.microsoft.com/mapi/proptag/0x3712001E",
                     "logo_assinatura"
                 )
+
+            for anexo in anexos:
+                mail.Attachments.Add(anexo)
 
             if caixa_envio["conta_obj"] is not None:
                 mail.SendUsingAccount = caixa_envio["conta_obj"]
@@ -1282,17 +1324,19 @@ def main():
     assinatura_html = montar_assinatura_final(assinatura_docx_html, logo_path)
     template_path, corpo_html_template = selecionar_template(assinatura_html)
 
+    anexos = perguntar_anexos()
+
     assunto = input("Assunto do e-mail: ").strip()
     solicitar_confirmacao_leitura = perguntar_confirmacao_leitura()
     gerar_log, caminho_log = perguntar_geracao_log(planilha)
 
     if not mostrar_resumo_e_confirmar(email_usuario, planilha, caixa_envio, logo_path, template_path, assunto,
-                                       solicitar_confirmacao_leitura, gerar_log, caminho_log):
+                                       solicitar_confirmacao_leitura, gerar_log, caminho_log, anexos):
         print("Operação cancelada pelo usuário.")
         return
 
     enviar_emails(outlook, caixa_envio, planilha, logo_path, corpo_html_template, assunto,
-                  solicitar_confirmacao_leitura, gerar_log, caminho_log)
+                  solicitar_confirmacao_leitura, gerar_log, caminho_log, anexos)
 
 
 if __name__ == "__main__":
